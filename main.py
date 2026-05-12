@@ -66,10 +66,28 @@ class RocomPlugin(Star):
         self.show_other_time_slots_today = self.config.get(
             "show_other_time_slots_today", True
         )
+        self.merchant_subscription_times = self._parse_merchant_subscription_times(
+            self.config.get("merchant_subscription_times", ["08:01", "12:01", "16:01", "20:01"])
+        )
         self._merchant_subscription_task = None
-        self._merchant_retry_delay_seconds = 240
-        self._merchant_retry_times = 3
-        self._merchant_jitter_seconds = 30
+        try:
+            self._merchant_retry_delay_seconds = max(
+                1, int(self.config.get("merchant_subscription_retry_delay_seconds", 240) or 240)
+            )
+        except (TypeError, ValueError):
+            self._merchant_retry_delay_seconds = 240
+        try:
+            self._merchant_retry_times = max(
+                0, int(self.config.get("merchant_subscription_retry_times", 3) or 3)
+            )
+        except (TypeError, ValueError):
+            self._merchant_retry_times = 3
+        try:
+            self._merchant_jitter_seconds = max(
+                0, int(self.config.get("merchant_subscription_jitter_seconds", 30) or 30)
+            )
+        except (TypeError, ValueError):
+            self._merchant_jitter_seconds = 30
         self.home_subscription_enabled = self.config.get(
             "home_subscription_enabled", True
         )
@@ -785,15 +803,38 @@ class RocomPlugin(Star):
             await self.home_sub_mgr.upsert_subscription(key, sub)
             await asyncio.sleep(2)
 
+    def _parse_merchant_subscription_times(self, raw_times: Any) -> List[tuple[int, int]]:
+        default_times = [(8, 1), (12, 1), (16, 1), (20, 1)]
+        if not isinstance(raw_times, list):
+            return default_times
+        parsed: List[tuple[int, int]] = []
+        seen = set()
+        for item in raw_times:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", text)
+            if not match:
+                continue
+            hour = int(match.group(1))
+            minute = int(match.group(2))
+            key = (hour, minute)
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed.append(key)
+        if not parsed:
+            return default_times
+        parsed.sort(key=lambda x: (x[0], x[1]))
+        return parsed
+
     def _merchant_check_times(self, base: datetime | None = None) -> List[datetime]:
         now = base or datetime.now(self._cn_tz())
         if now.tzinfo is None:
             now = now.replace(tzinfo=self._cn_tz())
         return [
-            now.replace(hour=8, minute=1, second=0, microsecond=0),
-            now.replace(hour=12, minute=1, second=0, microsecond=0),
-            now.replace(hour=16, minute=1, second=0, microsecond=0),
-            now.replace(hour=20, minute=1, second=0, microsecond=0),
+            now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            for hour, minute in self.merchant_subscription_times
         ]
 
     def _next_merchant_check_time(self, now: datetime | None = None) -> datetime:

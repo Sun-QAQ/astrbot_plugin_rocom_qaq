@@ -47,8 +47,35 @@
   "merchant_subscription_enabled": {
     "type": "bool",
     "description": "启用远行商人订阅推送",
-    "hint": "开启后会在每日 08:01 / 12:01 / 16:01 / 20:01 前后 30 秒随机检查一次，若为空则每 4 分钟前后 30 秒最多重试 3 次",
+    "hint": "开启后按 merchant_subscription_times 配置时刻进行检查，空结果按重试参数重试",
     "default": true
+  },
+  "merchant_subscription_times": {
+    "type": "list",
+    "description": "远行商人订阅检查时间",
+    "hint": "每天执行订阅检查的时间点（24 小时制 HH:MM）",
+    "default": ["08:01", "12:01", "16:01", "20:01"],
+    "items": {
+      "type": "string"
+    }
+  },
+  "merchant_subscription_retry_delay_seconds": {
+    "type": "int",
+    "description": "远行商人订阅重试间隔",
+    "hint": "空结果重试间隔（秒）",
+    "default": 240
+  },
+  "merchant_subscription_retry_times": {
+    "type": "int",
+    "description": "远行商人订阅重试次数",
+    "hint": "空结果最大重试次数",
+    "default": 3
+  },
+  "merchant_subscription_jitter_seconds": {
+    "type": "int",
+    "description": "远行商人订阅随机抖动",
+    "hint": "检查和重试前后随机偏移秒数",
+    "default": 30
   },
   "merchant_subscription_items": {
     "type": "list",

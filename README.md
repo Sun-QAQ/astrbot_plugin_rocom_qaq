@@ -83,7 +83,11 @@ playwright install chromium
 | `api_base_url`   | string | `https://wegame.shallow.ink` | API 服务后端地址                              |
 | `wegame_api_key` | string | 无                            | ⚠️ 必填，拥有 wegame 作用域的 API Key，统一用于各项查询获取 |
 | `render_timeout` | number | `30000`                      | 图片渲染超时时间（毫秒）                            |
-| `merchant_subscription_enabled` | bool | `true` | 是否启用远行商人订阅推送（在 08:01 / 12:01 / 16:01 / 20:01 前后 30 秒随机检查，空结果每 4 分钟前后 30 秒最多重试 3 次） |
+| `merchant_subscription_enabled` | bool | `true` | 是否启用远行商人订阅推送 |
+| `merchant_subscription_times` | list | `["08:01","12:01","16:01","20:01"]` | 每日订阅检查时间（24 小时制 `HH:MM`） |
+| `merchant_subscription_retry_delay_seconds` | int | `240` | 空结果重试间隔（秒） |
+| `merchant_subscription_retry_times` | int | `3` | 空结果最大重试次数 |
+| `merchant_subscription_jitter_seconds` | int | `30` | 检查和重试前后的随机偏移（秒） |
 | `merchant_subscription_items` | list | `["国王球","棱镜球","炫彩精灵蛋"]` | 远行商人默认订阅商品 |
 | `merchant_private_subscription_enabled` | bool | `true` | 是否允许用户在私聊中订阅远行商人推送 |
 | `show_other_time_slots_today` | bool | `true` | 是否在远行商人渲染页展示“今日其他时段”区域 |
