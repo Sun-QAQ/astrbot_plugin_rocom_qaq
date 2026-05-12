@@ -90,6 +90,7 @@ playwright install chromium
 | `merchant_subscription_jitter_seconds` | int | `30` | 检查和重试前后的随机偏移（秒） |
 | `merchant_subscription_items` | list | `["国王球","棱镜球","炫彩精灵蛋"]` | 远行商人默认订阅商品 |
 | `merchant_private_subscription_enabled` | bool | `true` | 是否允许用户在私聊中订阅远行商人推送 |
+| `merchant_subscription_push_without_match` | bool | `false` | 是否在未命中订阅商品时仍推送远行商人当轮信息 |
 | `show_other_time_slots_today` | bool | `true` | 是否在远行商人渲染页展示“今日其他时段”区域 |
 | `home_subscription_enabled` | bool | `true` | 是否启用家园菜园和精灵灵感订阅推送 |
 | `home_subscription_interval_minutes` | int | `5` | 家园订阅检查间隔（分钟），按首个完成/全部完成两档推送 |

@@ -63,6 +63,9 @@ class RocomPlugin(Star):
         self.merchant_private_subscription_enabled = self.config.get(
             "merchant_private_subscription_enabled", True
         )
+        self.merchant_subscription_push_without_match = self.config.get(
+            "merchant_subscription_push_without_match", False
+        )
         self.show_other_time_slots_today = self.config.get(
             "show_other_time_slots_today", True
         )
@@ -1156,7 +1159,9 @@ class RocomPlugin(Star):
         for key, sub in all_subs.items():
             items = sub.get("items") or self.merchant_subscription_items
             matched = [name for name in items if name in product_names]
-            if not matched or sub.get("last_push_round") == round_info["round_id"]:
+            if sub.get("last_push_round") == round_info["round_id"]:
+                continue
+            if not matched and not self.merchant_subscription_push_without_match:
                 continue
             pending_pushes.append((key, sub, matched))
         if not pending_pushes:
@@ -1167,19 +1172,21 @@ class RocomPlugin(Star):
         except Exception as e:
             logger.warning(f"[Rocom] 远行商人订阅图片预渲染失败，将仅发送文本: {e}")
         for key, sub, matched in pending_pushes:
+            if matched:
+                push_text = f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
+                fallback_text = f"远行商人本轮命中订阅商品：{'、'.join(matched)}"
+            else:
+                push_text = f"远行商人本轮商品播报（未命中订阅商品）\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
+                fallback_text = "远行商人本轮商品播报（未命中订阅商品）"
             text_chain = MessageChain()
             if sub.get("mention_all"):
                 text_chain.at_all()
-            text_chain.message(
-                f"远行商人本轮命中订阅商品：{'、'.join(matched)}\n轮次：第{round_info['current']}轮\n剩余：{round_info['countdown']}"
-            )
+            text_chain.message(push_text)
             try:
                 await self.context.send_message(sub["umo"], text_chain)
             except Exception as e:
                 logger.warning(f"[Rocom] 远行商人订阅文本推送失败: {e}")
-                fallback = MessageChain().message(
-                    f"远行商人本轮命中订阅商品：{'、'.join(matched)}"
-                )
+                fallback = MessageChain().message(fallback_text)
                 try:
                     await self.context.send_message(sub["umo"], fallback)
                 except Exception as fallback_e:

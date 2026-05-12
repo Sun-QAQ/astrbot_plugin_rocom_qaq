@@ -92,6 +92,12 @@
     "hint": "开启后允许用户在私聊中订阅远行商人推送",
     "default": true
   },
+  "merchant_subscription_push_without_match": {
+    "type": "bool",
+    "description": "远行商人无命中也推送",
+    "hint": "开启后即使未命中订阅商品也会推送当轮商人信息",
+    "default": false
+  },
   "show_other_time_slots_today": {
     "type": "bool",
     "description": "展示远行商人今日其他时段",
