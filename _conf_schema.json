@@ -65,6 +65,12 @@
     "hint": "开启后允许用户在私聊中订阅远行商人推送",
     "default": true
   },
+  "show_other_time_slots_today": {
+    "type": "bool",
+    "description": "展示远行商人今日其他时段",
+    "hint": "开启后在远行商人渲染页展示“今日其他时段”区域",
+    "default": true
+  },
   "home_subscription_enabled": {
     "type": "bool",
     "description": "启用家园菜园和灵感订阅推送",

@@ -63,6 +63,9 @@ class RocomPlugin(Star):
         self.merchant_private_subscription_enabled = self.config.get(
             "merchant_private_subscription_enabled", True
         )
+        self.show_other_time_slots_today = self.config.get(
+            "show_other_time_slots_today", True
+        )
         self._merchant_subscription_task = None
         self._merchant_retry_delay_seconds = 240
         self._merchant_retry_times = 3
@@ -1060,6 +1063,7 @@ class RocomPlugin(Star):
             "round_info": round_info or self._current_merchant_round(),
             "products": products or [],
             "history_groups": history_groups or [],
+            "show_other_time_slots_today": self.show_other_time_slots_today,
         }
         img_url = await self.renderer.render_html(
             "render/yuanxing-shangren/index.html",
