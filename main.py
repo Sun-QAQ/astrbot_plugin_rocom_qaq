@@ -91,6 +91,8 @@ class RocomPlugin(Star):
             )
         except (TypeError, ValueError):
             self._merchant_jitter_seconds = 30
+        self._merchant_late_grace_seconds = 90
+        self._last_merchant_check_key = ""
         self.home_subscription_enabled = self.config.get(
             "home_subscription_enabled", True
         )
@@ -840,30 +842,45 @@ class RocomPlugin(Star):
             for hour, minute in self.merchant_subscription_times
         ]
 
-    def _next_merchant_check_time(self, now: datetime | None = None) -> datetime:
+    def _next_merchant_check_time(self, now: datetime | None = None) -> tuple[datetime, bool]:
         current = now or datetime.now(self._cn_tz())
         if current.tzinfo is None:
             current = current.replace(tzinfo=self._cn_tz())
-        for check_time in self._merchant_check_times(current):
+        grace_seconds = max(1, int(self._merchant_late_grace_seconds or 90))
+        check_times = self._merchant_check_times(current)
+        for check_time in reversed(check_times):
+            late_seconds = (current - check_time).total_seconds()
+            check_key = check_time.strftime("%Y-%m-%d %H:%M")
+            if 0 < late_seconds <= grace_seconds and check_key != self._last_merchant_check_key:
+                return check_time, True
+        for check_time in check_times:
             if check_time > current:
-                return check_time
+                return check_time, False
         next_day = current + timedelta(days=1)
-        return self._merchant_check_times(next_day)[0]
+        return self._merchant_check_times(next_day)[0], False
 
     async def _merchant_subscription_loop(self):
         logger.info("[Rocom] 远行商人订阅循环任务已启动")
         while True:
             try:
                 now = datetime.now(self._cn_tz())
-                next_check = self._next_merchant_check_time(now)
-                jitter = random.uniform(-self._merchant_jitter_seconds, self._merchant_jitter_seconds)
-                target_check = next_check + timedelta(seconds=jitter)
-                sleep_seconds = max(1, (target_check - now).total_seconds())
-                logger.info(
-                    f"[Rocom] 下次远行商人订阅检查时间：{target_check.strftime('%Y-%m-%d %H:%M:%S CST')}（基准 {next_check.strftime('%H:%M:%S')}，随机偏移 {jitter:.1f}s）"
-                )
+                next_check, is_late_catchup = self._next_merchant_check_time(now)
+                if is_late_catchup:
+                    target_check = now
+                    sleep_seconds = 1
+                    logger.info(
+                        f"[Rocom] 远行商人订阅轻微迟到补查：{now.strftime('%Y-%m-%d %H:%M:%S CST')}（基准 {next_check.strftime('%H:%M:%S')}）"
+                    )
+                else:
+                    jitter = random.uniform(-self._merchant_jitter_seconds, self._merchant_jitter_seconds)
+                    target_check = next_check + timedelta(seconds=jitter)
+                    sleep_seconds = max(1, (target_check - now).total_seconds())
+                    logger.info(
+                        f"[Rocom] 下次远行商人订阅检查时间：{target_check.strftime('%Y-%m-%d %H:%M:%S CST')}（基准 {next_check.strftime('%H:%M:%S')}，随机偏移 {jitter:.1f}s）"
+                    )
                 await asyncio.sleep(sleep_seconds)
                 await self._run_merchant_subscription_window()
+                self._last_merchant_check_key = next_check.strftime("%Y-%m-%d %H:%M")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
