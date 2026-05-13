@@ -865,6 +865,7 @@ class RocomPlugin(Star):
             try:
                 now = datetime.now(self._cn_tz())
                 next_check, is_late_catchup = self._next_merchant_check_time(now)
+                slot_key = next_check.strftime("%Y-%m-%d %H:%M")
                 if is_late_catchup:
                     target_check = now
                     sleep_seconds = 1
@@ -879,8 +880,8 @@ class RocomPlugin(Star):
                         f"[Rocom] 下次远行商人订阅检查时间：{target_check.strftime('%Y-%m-%d %H:%M:%S CST')}（基准 {next_check.strftime('%H:%M:%S')}，随机偏移 {jitter:.1f}s）"
                     )
                 await asyncio.sleep(sleep_seconds)
-                await self._run_merchant_subscription_window()
-                self._last_merchant_check_key = next_check.strftime("%Y-%m-%d %H:%M")
+                await self._run_merchant_subscription_window(slot_key)
+                self._last_merchant_check_key = slot_key
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1137,7 +1138,7 @@ class RocomPlugin(Star):
         )
         return img_url
 
-    async def _run_merchant_subscription_window(self):
+    async def _run_merchant_subscription_window(self, slot_key: str):
         for retry_index in range(self._merchant_retry_times + 1):
             if retry_index > 0:
                 delay = max(
@@ -1149,14 +1150,14 @@ class RocomPlugin(Star):
                     f"[Rocom] 远行商人返回为空，{delay:.1f} 秒后进行第 {retry_index} 次重试"
                 )
                 await asyncio.sleep(delay)
-            status = await self._check_merchant_subscriptions()
+            status = await self._check_merchant_subscriptions(slot_key)
             if status != "empty":
                 return
             if retry_index >= self._merchant_retry_times:
                 logger.warning("[Rocom] 远行商人订阅检查连续为空，已暂停本轮重试")
                 return
 
-    async def _check_merchant_subscriptions(self) -> str:
+    async def _check_merchant_subscriptions(self, slot_key: str) -> str:
         all_subs = await self.merchant_sub_mgr.get_all_subscriptions()
         if not all_subs:
             return "no_subscriptions"
@@ -1176,7 +1177,7 @@ class RocomPlugin(Star):
         for key, sub in all_subs.items():
             items = sub.get("items") or self.merchant_subscription_items
             matched = [name for name in items if name in product_names]
-            if sub.get("last_push_round") == round_info["round_id"]:
+            if sub.get("last_push_slot") == slot_key:
                 continue
             if not matched and not self.merchant_subscription_push_without_match:
                 continue
@@ -1216,6 +1217,7 @@ class RocomPlugin(Star):
                 except Exception as image_e:
                     logger.warning(f"[Rocom] 远行商人订阅图片推送失败: {image_e}")
             sub["last_push_round"] = round_info["round_id"]
+            sub["last_push_slot"] = slot_key
             sub["last_matched_items"] = matched
             await self.merchant_sub_mgr.upsert_subscription(key, sub)
             await asyncio.sleep(5)
@@ -3399,6 +3401,7 @@ class RocomPlugin(Star):
                 "mention_all": mention,
                 "items": selected_items,
                 "last_push_round": "",
+                "last_push_slot": "",
                 "last_matched_items": [],
                 "updated_by": str(event.get_sender_id()),
             },
