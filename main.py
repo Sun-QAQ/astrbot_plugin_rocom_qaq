@@ -3407,9 +3407,15 @@ class RocomPlugin(Star):
             },
         )
         source_hint = "自定义商品" if custom_items is not None else "WebUI 默认商品"
-        mention_hint = f"命中后{'会' if mention else '不会'}@全体" if not event.is_private_chat() else ""
+        if self.merchant_subscription_push_without_match:
+            mode_hint = "按配置时间推送（不要求命中订阅商品）"
+            items_hint = f"订阅商品（命中模式参考）：{'、'.join(selected_items)}（{source_hint}）"
+        else:
+            mode_hint = "仅命中订阅商品时推送"
+            items_hint = f"监听商品：{'、'.join(selected_items)}（{source_hint}）"
+        mention_hint = "私聊不支持@全体" if event.is_private_chat() else ("会@全体" if mention else "不@全体")
         yield event.plain_result(
-            f"已订阅远行商人，监听商品：{'、'.join(selected_items)}（{source_hint}）；{mention_hint}\n"
+            f"已订阅远行商人，{items_hint}；推送模式：{mode_hint}；{mention_hint}\n"
             f"订阅方式：/订阅远行商人 1 为 @全体（仅群聊），/订阅远行商人 0 为不@全体，"
             f"/订阅远行商人 1 国王球 棱镜球 为自定义商品，"
             f"/取消订阅远行商人 可关闭订阅。"
