@@ -854,6 +854,9 @@ class RocomPlugin(Star):
             if 0 < late_seconds <= grace_seconds and check_key != self._last_merchant_check_key:
                 return check_time, True
         for check_time in check_times:
+            check_key = check_time.strftime("%Y-%m-%d %H:%M")
+            if check_key == self._last_merchant_check_key:
+                continue
             if check_time > current:
                 return check_time, False
         next_day = current + timedelta(days=1)
