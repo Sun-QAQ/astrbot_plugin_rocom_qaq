@@ -87,7 +87,7 @@ playwright install chromium
 | `merchant_subscription_times` | list | `["08:01","12:01","16:01","20:01"]` | 每日订阅检查时间（24 小时制 `HH:MM`） |
 | `merchant_subscription_retry_delay_seconds` | int | `240` | 空结果重试间隔（秒） |
 | `merchant_subscription_retry_times` | int | `3` | 空结果最大重试次数 |
-| `merchant_subscription_jitter_seconds` | int | `30` | 检查和重试前后的随机偏移（秒） |
+| `merchant_subscription_jitter_seconds` | int | `30` | 订阅检查随机延后、空结果重试前后随机抖动（秒） |
 | `merchant_subscription_items` | list | `["国王球","棱镜球","炫彩精灵蛋"]` | 远行商人默认订阅商品 |
 | `merchant_private_subscription_enabled` | bool | `true` | 是否允许用户在私聊中订阅远行商人推送 |
 | `merchant_subscription_push_without_match` | bool | `false` | 是否在未命中订阅商品时仍推送远行商人当轮信息 |
@@ -282,7 +282,7 @@ astrbot_plugin_rocom/
 - 远行商人渲染页新增“今日其他时段”区域，按时间段展示当日其他轮次商品，每段最多展示 5 个
 
 **优化**
-- 远行商人订阅检查增加 `±30s` 随机延迟，空返回重试也加入 `±30s` 抖动，降低刷新窗口和并发请求冲突
+- 远行商人订阅检查增加 `0~30s` 随机延后，空返回重试保留 `±30s` 抖动，降低刷新窗口和并发请求冲突
 - 家园订阅推送将 UID 展示优化为本地绑定的洛克昵称，并自动 @ 对应绑定 QQ 用户
 
 **修复**

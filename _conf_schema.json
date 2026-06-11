@@ -73,8 +73,8 @@
   },
   "merchant_subscription_jitter_seconds": {
     "type": "int",
-    "description": "远行商人订阅随机抖动",
-    "hint": "检查和重试前后随机偏移秒数",
+    "description": "远行商人订阅随机延迟/抖动",
+    "hint": "订阅检查随机延后、空结果重试前后随机抖动秒数",
     "default": 30
   },
   "merchant_subscription_items": {

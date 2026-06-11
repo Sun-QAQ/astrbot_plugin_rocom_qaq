@@ -862,6 +862,9 @@ class RocomPlugin(Star):
         next_day = current + timedelta(days=1)
         return self._merchant_check_times(next_day)[0], False
 
+    def _merchant_check_jitter_seconds(self) -> float:
+        return random.uniform(0, self._merchant_jitter_seconds)
+
     async def _merchant_subscription_loop(self):
         logger.info("[Rocom] 远行商人订阅循环任务已启动")
         while True:
@@ -876,7 +879,7 @@ class RocomPlugin(Star):
                         f"[Rocom] 远行商人订阅轻微迟到补查：{now.strftime('%Y-%m-%d %H:%M:%S CST')}（基准 {next_check.strftime('%H:%M:%S')}）"
                     )
                 else:
-                    jitter = random.uniform(-self._merchant_jitter_seconds, self._merchant_jitter_seconds)
+                    jitter = self._merchant_check_jitter_seconds()
                     target_check = next_check + timedelta(seconds=jitter)
                     sleep_seconds = max(1, (target_check - now).total_seconds())
                     logger.info(
