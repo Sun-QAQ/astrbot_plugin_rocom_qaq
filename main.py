@@ -6,9 +6,13 @@ import asyncio
 import re
 import json
 import random
+import shutil
+import zipfile
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Callable, Awaitable
 
+import httpx
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
@@ -16,14 +20,27 @@ from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import Plain, Image
 
 from .core.client import RocomClient
-from .core.user import UserManager, MerchantSubscriptionManager, HomeSubscriptionManager
+from .core.user import (
+    UserManager,
+    MerchantSubscriptionManager,
+    HomeSubscriptionManager,
+    AnnouncementSubscriptionManager,
+)
 from .core.render import Renderer
 from .core.egg_service import EggService, SearchResult
+from .core.font_assets import FontAssetManager
+from .core.wiki_catalog import (
+    WIKI_CATALOG_ROUTES_BY_ALIAS,
+    WIKI_CATALOG_ROUTES_BY_KEY,
+)
 
-@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组", "洛克王国插件", "v3.1.1", "https://github.com/Entropy-Increase-Team/astrbot_plugin_rocom")
+@register("astrbot_plugin_rocom", "bvzrays & 熵增项目组", "洛克王国插件", "v3.8.0", "https://github.com/Entropy-Increase-Team/astrbot_plugin_rocom")
 class RocomPlugin(Star):
+    _BACKGROUND_REGISTRY_KEY = "_astrbot_plugin_rocom_background_tasks"
+
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
+        self._instance_id = f"{id(self):x}"
         self.config = config or {}
         base_url = self.config.get("api_base_url", "https://wegame.shallow.ink")
         wegame_api_key = self.config.get("wegame_api_key", "")
@@ -32,17 +49,32 @@ class RocomPlugin(Star):
             base_url=base_url,
             wegame_api_key=wegame_api_key,
         )
+        self._wiki_catalogs_cache: Dict[str, Any] | None = None
+        self._wiki_catalogs_cache_ts = 0.0
+        self._wiki_options_cache: Dict[str, Any] | None = None
+        self._wiki_options_cache_ts = 0.0
+        self._wiki_skill_detail_cache: Dict[str, Dict[str, Any]] = {}
+        self._wiki_pet_size_cache: Dict[str, Dict[str, Any]] = {}
         
         data_dir = str(StarTools.get_data_dir())
+        self.data_dir = data_dir
+        self.atlas_dir = os.path.join(data_dir, "rocom_atlas")
         self.user_mgr = UserManager(data_dir)
         self.merchant_sub_mgr = MerchantSubscriptionManager(data_dir)
         self.home_sub_mgr = HomeSubscriptionManager(data_dir)
+        self.announcement_sub_mgr = AnnouncementSubscriptionManager(data_dir)
         
         render_timeout = self.config.get("render_timeout", 30000)
+        self.low_bandwidth_mode = bool(self.config.get("low_bandwidth_mode", False))
         self.help_prefix_display = str(self.config.get("help_prefix_display", "") or "")
         # res_path point to astrbot_plugin_rocom directory
         res_path = os.path.abspath(os.path.dirname(__file__))
-        self.renderer = Renderer(res_path=res_path, render_timeout=render_timeout)
+        self.font_paths = FontAssetManager(res_path=res_path, data_dir=data_dir).ensure_fonts()
+        self.renderer = Renderer(
+            res_path=res_path,
+            render_timeout=render_timeout,
+            font_paths=self.font_paths,
+        )
         self.home_plant_map = self._load_home_plant_map(res_path)
         
         # 自动刷新配置
@@ -103,43 +135,114 @@ class RocomPlugin(Star):
         except (TypeError, ValueError):
             self.home_subscription_interval_minutes = 5
         self._home_subscription_task = None
+        self.announcement_subscription_enabled = self.config.get(
+            "announcement_subscription_enabled", True
+        )
+        try:
+            self.announcement_poll_interval_minutes = int(
+                self.config.get("announcement_poll_interval_minutes", 10) or 10
+            )
+        except (TypeError, ValueError):
+            self.announcement_poll_interval_minutes = 10
+        self._announcement_subscription_task = None
         
         # 启动时检查是否需要开启自动刷新
         logger.info(f"[Rocom] 插件初始化完成，自动刷新启用状态：{self.auto_refresh_enabled}, 刷新时间：{self.auto_refresh_time}, 通知群：{self.auto_refresh_notify_group}")
+        self._cancel_stale_background_tasks()
         if self.auto_refresh_enabled:
-            self._auto_refresh_task = asyncio.create_task(self._auto_refresh_loop())
+            self._auto_refresh_task = self._register_background_task(
+                "auto_refresh",
+                self._auto_refresh_loop(),
+            )
             logger.info("[Rocom] 自动刷新任务已启动")
         else:
             logger.info("[Rocom] 自动刷新功能未启用")
         
         if self.merchant_subscription_enabled:
-            self._merchant_subscription_task = asyncio.create_task(
-                self._merchant_subscription_loop()
+            self._merchant_subscription_task = self._register_background_task(
+                "merchant_subscription",
+                self._merchant_subscription_loop(),
             )
         if self.home_subscription_enabled:
-            self._home_subscription_task = asyncio.create_task(
-                self._home_subscription_loop()
+            self._home_subscription_task = self._register_background_task(
+                "home_subscription",
+                self._home_subscription_loop(),
+            )
+        if self.announcement_subscription_enabled:
+            self._announcement_subscription_task = self._register_background_task(
+                "announcement_subscription",
+                self._announcement_subscription_loop(),
             )
 
+    def _background_task_registry(self) -> Dict[str, asyncio.Task]:
+        loop = asyncio.get_running_loop()
+        registry = getattr(loop, self._BACKGROUND_REGISTRY_KEY, None)
+        if not isinstance(registry, dict):
+            registry = {}
+            setattr(loop, self._BACKGROUND_REGISTRY_KEY, registry)
+        return registry
+
+    def _cancel_stale_background_tasks(self):
+        registry = self._background_task_registry()
+        for name, task in list(registry.items()):
+            if task and not task.done():
+                logger.warning(f"[Rocom] 取消旧后台任务：{name}")
+                task.cancel()
+        registry.clear()
+
+    def _register_background_task(self, name: str, coro) -> asyncio.Task:
+        task = asyncio.create_task(
+            coro,
+            name=f"rocom:{name}:{self._instance_id}",
+        )
+        self._background_task_registry()[name] = task
+        return task
+
+    def _unregister_background_task(self, name: str, task: asyncio.Task | None):
+        if not task:
+            return
+        registry = self._background_task_registry()
+        if registry.get(name) is task:
+            registry.pop(name, None)
+
     async def terminate(self):
+        if self._announcement_subscription_task and not self._announcement_subscription_task.done():
+            self._announcement_subscription_task.cancel()
+            try:
+                await self._announcement_subscription_task
+            except asyncio.CancelledError:
+                pass
+        self._unregister_background_task(
+            "announcement_subscription",
+            self._announcement_subscription_task,
+        )
         if self._home_subscription_task and not self._home_subscription_task.done():
             self._home_subscription_task.cancel()
             try:
                 await self._home_subscription_task
             except asyncio.CancelledError:
                 pass
+        self._unregister_background_task(
+            "home_subscription",
+            self._home_subscription_task,
+        )
         if self._merchant_subscription_task and not self._merchant_subscription_task.done():
             self._merchant_subscription_task.cancel()
             try:
                 await self._merchant_subscription_task
             except asyncio.CancelledError:
                 pass
+        self._unregister_background_task(
+            "merchant_subscription",
+            self._merchant_subscription_task,
+        )
         if self._auto_refresh_task and not self._auto_refresh_task.done():
             self._auto_refresh_task.cancel()
             try:
                 await self._auto_refresh_task
             except asyncio.CancelledError:
                 pass
+        self._unregister_background_task("auto_refresh", self._auto_refresh_task)
         await self.client.close()
         await self.renderer.close()
 
@@ -181,6 +284,24 @@ class RocomPlugin(Star):
         fw_token = binding.get("framework_token", "")
         logger.debug(f"[Rocom] 用户 {user_id} 的主账号 Token: {fw_token[:8]}...")
         return fw_token
+
+    async def _resolve_ingame_identity(
+        self, event: AstrMessageEvent, uid: str = ""
+    ) -> tuple[str, str, str]:
+        uid = str(uid or "").strip()
+        user_identifier = self._get_user_identifier(event)
+        if uid:
+            return uid, "", user_identifier
+
+        binding = await self.user_mgr.get_primary_binding(event.get_sender_id())
+        if not binding:
+            return "", "", user_identifier
+
+        return (
+            str(binding.get("role_id", "") or ""),
+            str(binding.get("framework_token", "") or ""),
+            user_identifier,
+        )
 
     async def _auto_refresh_loop(self):
         """自动刷新循环任务（非必要不要使用）"""
@@ -475,6 +596,40 @@ class RocomPlugin(Star):
         now_ts = int(time.time())
         has_inspiration = bool(rip_time)
         inspire_ready = has_inspiration and now_ts >= rip_time
+        egg_time = self._normalize_epoch_seconds(
+            raw.get("predicted_egg_time")
+            or home_pet.get("predicted_egg_time")
+            or raw.get("egg_time")
+            or home_pet.get("egg_time")
+        )
+        egg_ready = bool(egg_time and now_ts >= egg_time)
+        speciality_values = []
+        for value in (
+            home_pet.get("real_speciality_ids"),
+            raw.get("real_speciality_ids"),
+            home_pet.get("speciality_id"),
+            raw.get("speciality_id"),
+        ):
+            if isinstance(value, list):
+                speciality_values.extend(value)
+            elif value not in (None, ""):
+                speciality_values.append(value)
+        speciality_ids = {str(value).strip() for value in speciality_values if str(value).strip()}
+        mutation_name = str(display.get("mutation_name") or raw.get("mutation_name") or home_pet.get("mutation_name") or "")
+        variant_text = ""
+        if "异色" in mutation_name and "炫彩" in mutation_name:
+            variant_text = "异色炫彩"
+        elif "异色" in mutation_name:
+            variant_text = "异色"
+        elif "炫彩" in mutation_name:
+            variant_text = "炫彩"
+        elif "103" in speciality_ids and "502" in speciality_ids:
+            variant_text = "异色炫彩"
+        elif "103" in speciality_ids:
+            variant_text = "异色"
+        elif "502" in speciality_ids:
+            variant_text = "炫彩"
+        is_shiny = variant_text in {"异色", "异色炫彩"}
         status = raw.get("status")
         is_guard = guard or bool(raw.get("is_guard") or raw.get("guard")) or str(status).lower() in {"2", "guard", "守卫"}
         status_text = "守卫中" if is_guard and not has_inspiration else ("灵感已完成" if inspire_ready else ("灵感收集中" if has_inspiration else "未喂食"))
@@ -486,10 +641,16 @@ class RocomPlugin(Star):
             "level": display.get("level") or raw.get("level") or home_pet.get("level") or "--",
             "iconUrl": self._home_pet_icon(pet_id, raw.get("icon_url") or raw.get("pet_img_url") or raw.get("petIcon") or ""),
             "badge": "守" if is_guard else "",
+            "isShiny": is_shiny,
+            "variantText": variant_text,
             "isGuard": is_guard,
             "statusText": status_text,
             "statusClass": status_class,
             "note": self._format_home_remaining(rip_time, now_ts) if has_inspiration else ("家园守卫位" if is_guard else "暂无灵感倒计时"),
+            "hasEgg": bool(raw.get("have_egg") or home_pet.get("have_egg")),
+            "eggReady": egg_ready,
+            "eggTime": egg_time,
+            "eggText": ("可能已生蛋" if egg_ready else f"预计生蛋 {self._format_home_remaining(egg_time, now_ts)}") if egg_time else "",
             "inspireReady": inspire_ready,
             "readyAt": rip_time,
             "eventId": f"pet:{raw.get('pos') or index + 1}:{pet_id}:{rip_time}",
@@ -659,6 +820,564 @@ class RocomPlugin(Star):
             "updatedAt": updated_at,
         }
 
+    def _pet_data_display(self, value: Any, default: str = "--") -> str:
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            return "是" if value else "否"
+        return str(value)
+
+    def _pet_data_image_url(self, pet_id: Any, image_type: str = "image") -> str:
+        try:
+            asset_id = int(str(pet_id))
+        except (TypeError, ValueError):
+            return ""
+        if asset_id <= 0:
+            return ""
+        if asset_id < 3000:
+            asset_id += 3000
+        image_type = "icon" if image_type == "icon" else "image"
+        return f"https://game.gtimg.cn/images/rocom/rocodata/jingling/{asset_id}/{image_type}.png"
+
+    def _pet_data_time_text(self, value: Any) -> str:
+        ts = self._normalize_epoch_seconds(value)
+        if not ts:
+            return "--"
+        return datetime.fromtimestamp(ts, tz=self._cn_tz()).strftime("%Y-%m-%d %H:%M")
+
+    def _pet_data_size_text(self, value: Any, unit: str) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "--"
+        if unit == "g":
+            return f"{number / 1000:.2f} kg"
+        if unit == "cm":
+            return f"{number:g} cm"
+        return f"{number:g} {unit}".strip()
+
+    def _pet_data_voice_text(self, value: Any) -> str:
+        if value in (None, ""):
+            return "--"
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return self._pet_data_display(value)
+        if number.is_integer():
+            return f"{int(number)} dB"
+        return f"{number:g} dB"
+
+    def _pet_data_voice_hint(self, value: Any) -> str:
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            return ""
+        if 96 <= number <= 100:
+            return "婉转声 96~100"
+        if -100 <= number <= -96:
+            return "粗嗓门 -96~-100"
+        return "婉转声 96~100 / 粗嗓门 -96~-100"
+
+    def _pet_data_voice_info(self, value: Any) -> Dict[str, str]:
+        text = self._pet_data_voice_text(value)
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            return {"value": text, "hint": "", "className": ""}
+        if 96 <= number <= 100:
+            return {
+                "value": f"{text} · 婉转声",
+                "hint": "婉转声 96~100",
+                "className": "voice-soft",
+            }
+        if -100 <= number <= -96:
+            return {
+                "value": f"{text} · 粗嗓门",
+                "hint": "粗嗓门 -96~-100",
+                "className": "voice-rough",
+            }
+        return {
+            "value": text,
+            "hint": "婉转声 96~100 / 粗嗓门 -96~-100",
+            "className": "",
+        }
+
+    def _pet_data_wiki_pet_id(self, value: Any) -> str:
+        try:
+            pet_id = int(str(value))
+        except (TypeError, ValueError):
+            return ""
+        if pet_id <= 0:
+            return ""
+        if pet_id < 3000:
+            pet_id += 3000
+        return str(pet_id)
+
+    def _pet_data_kg_compact(self, grams: Any) -> str:
+        try:
+            number = float(grams) / 1000
+        except (TypeError, ValueError):
+            return "--"
+        text = f"{number:.2f}".rstrip("0").rstrip(".")
+        return f"{text}kg"
+
+    def _pet_data_weight_size_info(
+        self,
+        pet: Dict[str, Any],
+        wiki_pet: Dict[str, Any] | None,
+    ) -> Dict[str, str]:
+        body_size = wiki_pet.get("body_size") if isinstance(wiki_pet, dict) else {}
+        weight_range = body_size.get("weight") if isinstance(body_size, dict) else {}
+        if not isinstance(weight_range, dict):
+            return {}
+        try:
+            current = float(pet.get("weight"))
+            low = float(weight_range.get("min_g"))
+            high = float(weight_range.get("max_g"))
+        except (TypeError, ValueError):
+            return {}
+        if high <= low:
+            return {}
+
+        span = high - low
+        small_cut = low + span * 0.05
+        large_cut = high - span * 0.05
+        range_text = f"{self._pet_data_kg_compact(low)}-{self._pet_data_kg_compact(high)}"
+        if current <= small_cut:
+            return {
+                "label": "小块头",
+                "className": "size-small",
+                "hint": f"小块头 · ≤{self._pet_data_kg_compact(small_cut)} · 范围 {range_text}",
+            }
+        if current >= large_cut:
+            return {
+                "label": "大块头",
+                "className": "size-large",
+                "hint": f"大块头 · ≥{self._pet_data_kg_compact(large_cut)} · 范围 {range_text}",
+            }
+        return {
+            "label": "",
+            "className": "",
+            "hint": f"范围 {range_text}",
+        }
+
+    def _pet_data_option_maps(self, options: Dict[str, Any] | None) -> Dict[str, Dict[str, str]]:
+        pet_options = (options or {}).get("pet") if isinstance(options, dict) else {}
+        if not isinstance(pet_options, dict):
+            pet_options = {}
+
+        def build_map(key: str, prefer_short: bool = False) -> Dict[str, str]:
+            result: Dict[str, str] = {}
+            values = pet_options.get(key)
+            if not isinstance(values, list):
+                return result
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("id")
+                if item_id in (None, ""):
+                    continue
+                name = item.get("short_name") if prefer_short and item.get("short_name") else item.get("name")
+                if name:
+                    result[str(item_id)] = str(name)
+            return result
+
+        natures: Dict[str, str] = {}
+        for item in pet_options.get("natures") or []:
+            if not isinstance(item, dict) or item.get("id") in (None, ""):
+                continue
+            name = str(item.get("name") or item.get("id"))
+            summary = str(item.get("summary") or "").strip()
+            natures[str(item.get("id"))] = f"{name}（{summary}）" if summary else name
+
+        return {
+            "natures": natures,
+            "bloodlines": build_map("bloodlines", prefer_short=True),
+            "types": build_map("types"),
+            "talent_ratings": build_map("talent_ratings"),
+        }
+
+    def _pet_data_lookup(self, mapping: Dict[str, str], value: Any, default: str = "--") -> str:
+        key = str(value or "").strip()
+        if not key:
+            return default
+        return mapping.get(key) or f"{key}"
+
+    def _pet_data_variant(self, pet: Dict[str, Any], fallback: Dict[str, Any] | None = None) -> tuple[str, str]:
+        fallback = fallback or {}
+        mutation_name = str(
+            pet.get("mutation_name")
+            or fallback.get("mutation_name")
+            or fallback.get("pet_mutation_name")
+            or ""
+        ).strip()
+        mutation_type = str(pet.get("mutation_type") or fallback.get("mutation_type") or "").strip()
+        speciality_values = []
+        for value in (
+            pet.get("real_speciality_ids"),
+            fallback.get("real_speciality_ids"),
+            pet.get("speciality_id"),
+            fallback.get("speciality_id"),
+        ):
+            if isinstance(value, list):
+                speciality_values.extend(value)
+            elif value not in (None, ""):
+                speciality_values.append(value)
+        speciality_ids = {str(value).strip() for value in speciality_values if str(value).strip()}
+
+        if mutation_type == "9" or ("异色" in mutation_name and "炫彩" in mutation_name) or ("103" in speciality_ids and "502" in speciality_ids):
+            return "异色炫彩", "异色炫彩.png"
+        if mutation_type == "1" or "异色" in mutation_name or "103" in speciality_ids:
+            return "异色", "异色.png"
+        if mutation_type == "8" or "炫彩" in mutation_name or "502" in speciality_ids:
+            return "炫彩", "炫彩.png"
+        return mutation_name or "普通", ""
+
+    def _pet_data_attributes(self, pet: Dict[str, Any]) -> List[Dict[str, str]]:
+        attribute_info = pet.get("attribute_info") if isinstance(pet.get("attribute_info"), dict) else {}
+        fields = [
+            ("hp", "生命"),
+            ("attack", "物攻"),
+            ("special_attack", "魔攻"),
+            ("defense", "物防"),
+            ("special_defense", "魔防"),
+            ("speed", "速度"),
+        ]
+        result = []
+        for key, label in fields:
+            raw = attribute_info.get(key) if isinstance(attribute_info.get(key), dict) else {}
+            try:
+                percent = int(max(6, min(100, float(raw.get("base_value") or 0) / 200 * 100)))
+            except (TypeError, ValueError):
+                percent = 6
+            result.append({
+                "label": label,
+                "value": self._pet_data_display(raw.get("base_value")),
+                "race": self._pet_data_display(raw.get("total_race")),
+                "talent": self._pet_data_display(raw.get("talent")),
+                "percent": percent,
+            })
+        return result
+
+    def _pet_data_skill_items(self, pet: Dict[str, Any]) -> List[Dict[str, Any]]:
+        skill_root = pet.get("skill") if isinstance(pet.get("skill"), dict) else {}
+        skills = skill_root.get("skill_data") if isinstance(skill_root.get("skill_data"), list) else []
+
+        def sort_key(item: Dict[str, Any]) -> tuple[int, int, int]:
+            equipped_rank = 0 if item.get("is_equipped") else 1
+            learned_rank = 0 if item.get("is_learned") else 1
+            try:
+                pos = int(item.get("pos") or 99)
+            except (TypeError, ValueError):
+                pos = 99
+            return equipped_rank, learned_rank, pos
+
+        return sorted([s for s in skills if isinstance(s, dict)], key=sort_key)
+
+    def _pet_data_skill_ids_from_payload(self, payload: Dict[str, Any]) -> List[str]:
+        raw_items: List[Dict[str, Any]] = []
+        if isinstance(payload.get("result"), dict):
+            payload = payload.get("result") or payload
+        if isinstance(payload.get("npc_pets"), list):
+            raw_items.extend([item for item in payload.get("npc_pets") or [] if isinstance(item, dict)])
+        elif isinstance(payload.get("npc_pet"), dict):
+            raw_items.append({"npc_pet": payload.get("npc_pet")})
+
+        ids: List[str] = []
+        for raw in raw_items:
+            npc_pet = raw.get("npc_pet") if isinstance(raw.get("npc_pet"), dict) else {}
+            pet = npc_pet.get("pet") if isinstance(npc_pet.get("pet"), dict) else {}
+            for item in self._pet_data_skill_items(pet)[:8]:
+                skill_id = str(item.get("id") or "").strip()
+                if skill_id and skill_id not in ids:
+                    ids.append(skill_id)
+        return ids
+
+    def _pet_data_pet_ids_from_payload(self, payload: Dict[str, Any]) -> List[str]:
+        raw_items: List[Dict[str, Any]] = []
+        if isinstance(payload.get("result"), dict):
+            payload = payload.get("result") or payload
+        if isinstance(payload.get("npc_pets"), list):
+            raw_items.extend([item for item in payload.get("npc_pets") or [] if isinstance(item, dict)])
+        elif isinstance(payload.get("npc_pet"), dict):
+            raw_items.append({"npc_pet": payload.get("npc_pet")})
+
+        ids: List[str] = []
+        for raw in raw_items:
+            npc_pet = raw.get("npc_pet") if isinstance(raw.get("npc_pet"), dict) else {}
+            pet = npc_pet.get("pet") if isinstance(npc_pet.get("pet"), dict) else {}
+            pet_id = self._pet_data_wiki_pet_id(
+                pet.get("base_conf_id")
+                or raw.get("pet_cfg_id")
+                or pet.get("catch_base_id")
+                or pet.get("conf_id")
+            )
+            if pet_id and pet_id not in ids:
+                ids.append(pet_id)
+        return ids
+
+    async def _pet_data_wiki_skill_lookup(self, res: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:
+        ids = self._pet_data_skill_ids_from_payload(res or {})
+        if not ids:
+            return {}
+
+        lookup: Dict[str, Dict[str, Any]] = {}
+        missing = []
+        for skill_id in ids:
+            cached = self._wiki_skill_detail_cache.get(skill_id)
+            if isinstance(cached, dict):
+                lookup[skill_id] = cached
+            else:
+                missing.append(skill_id)
+
+        semaphore = asyncio.Semaphore(6)
+
+        async def fetch(skill_id: str):
+            async with semaphore:
+                detail = await self.client.get_wiki_skill(skill_id)
+            if isinstance(detail, dict):
+                self._wiki_skill_detail_cache[skill_id] = detail
+                lookup[skill_id] = detail
+
+        if missing:
+            await asyncio.gather(*(fetch(skill_id) for skill_id in missing), return_exceptions=True)
+        return lookup
+
+    async def _pet_data_wiki_size_lookup(self, res: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:
+        ids = self._pet_data_pet_ids_from_payload(res or {})
+        if not ids:
+            return {}
+
+        lookup: Dict[str, Dict[str, Any]] = {}
+        missing = []
+        for pet_id in ids:
+            cached = self._wiki_pet_size_cache.get(pet_id)
+            if isinstance(cached, dict):
+                lookup[pet_id] = cached
+            else:
+                missing.append(pet_id)
+
+        semaphore = asyncio.Semaphore(6)
+
+        async def fetch(pet_id: str):
+            async with semaphore:
+                detail = await self.client.get_wiki_pet(pet_id)
+            if isinstance(detail, dict):
+                self._wiki_pet_size_cache[pet_id] = detail
+                lookup[pet_id] = detail
+
+        if missing:
+            await asyncio.gather(*(fetch(pet_id) for pet_id in missing), return_exceptions=True)
+        return lookup
+
+    def _pet_data_skill_icon_url(self, skill_id: Any, detail: Dict[str, Any] | None = None) -> str:
+        detail = detail or {}
+        icon = str(detail.get("icon") or "").strip()
+        if icon:
+            return icon
+        skill_text = str(skill_id or "").strip()
+        if not skill_text:
+            return ""
+        return f"{self.client.base_url}/api/v1/resources/wiki/assets/skills/{skill_text}.png"
+
+    def _pet_data_skills(
+        self,
+        pet: Dict[str, Any],
+        skill_lookup: Dict[str, Dict[str, Any]] | None = None,
+        load_skill_icons: bool = True,
+    ) -> List[Dict[str, str]]:
+        skill_lookup = skill_lookup or {}
+        result = []
+        for item in self._pet_data_skill_items(pet)[:8]:
+            skill_id = self._pet_data_display(item.get("id"))
+            detail = skill_lookup.get(str(skill_id)) if skill_id != "--" else {}
+            if item.get("is_equipped"):
+                status = "已装备"
+                status_class = "equipped"
+            elif item.get("is_learned"):
+                status = "已学会"
+                status_class = "learned"
+            else:
+                status = "未学会"
+                status_class = "locked"
+            element = self._wiki_named_value((detail or {}).get("element_type")) if detail else ""
+            skill_type = self._wiki_named_value((detail or {}).get("skill_type") or (detail or {}).get("damage_type")) if detail else ""
+            power = (detail or {}).get("power")
+            cost = (detail or {}).get("cost")
+            result.append({
+                "id": skill_id,
+                "name": str((detail or {}).get("name") or skill_id),
+                "icon": self._pet_data_skill_icon_url(skill_id, detail) if load_skill_icons else "",
+                "element": element or "未知",
+                "type": skill_type or "技能",
+                "power": self._pet_data_display(power),
+                "cost": self._pet_data_display(cost),
+                "pos": self._pet_data_display(item.get("pos")),
+                "status": status,
+                "statusClass": status_class,
+                "unlock": f"Lv.{item.get('unlock_need_lv')}" if item.get("unlock_need_lv") not in (None, "", 0) else "--",
+                "description": str((detail or {}).get("description") or (detail or {}).get("desc") or ""),
+            })
+        return result
+
+    def _pet_data_card_items(
+        self,
+        pet: Dict[str, Any],
+        option_maps: Dict[str, Dict[str, str]],
+        variant_text: str,
+        size_info: Dict[str, str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        gender_map = {"0": "未知", "1": "雄性", "2": "雌性"}
+        gender = gender_map.get(str(pet.get("gender") or ""), self._pet_data_display(pet.get("gender")))
+        nature = self._pet_data_lookup(option_maps.get("natures", {}), pet.get("nature"))
+        blood = self._pet_data_lookup(option_maps.get("bloodlines", {}), pet.get("blood_id"))
+        talent_rank = self._pet_data_lookup(option_maps.get("talent_ratings", {}), pet.get("talent_rank"), default=self._pet_data_display(pet.get("talent_rank")))
+        voice_info = self._pet_data_voice_info(pet.get("voice"))
+        size_info = size_info or {}
+        weight_value = self._pet_data_size_text(pet.get("weight"), "g")
+        if size_info.get("label"):
+            weight_value = f"{weight_value} · {size_info['label']}"
+        return [
+            {"label": "等级", "value": self._pet_data_display(pet.get("level"))},
+            {"label": "性别", "value": gender},
+            {"label": "分贝", **voice_info},
+            {"label": "性格", "value": nature},
+            {"label": "血脉", "value": blood},
+            {"label": "天赋评级", "value": talent_rank},
+            {"label": "身高", "value": self._pet_data_size_text(pet.get("height"), "cm")},
+            {
+                "label": "体重",
+                "value": weight_value,
+                "hint": size_info.get("hint", ""),
+                "className": size_info.get("className", ""),
+            },
+        ]
+
+    def _pet_data_extract_items(
+        self,
+        payload: Dict[str, Any],
+        option_maps: Dict[str, Dict[str, str]],
+        skill_lookup: Dict[str, Dict[str, Any]] | None = None,
+        size_lookup: Dict[str, Dict[str, Any]] | None = None,
+        load_skill_icons: bool = True,
+    ) -> List[Dict[str, Any]]:
+        raw_items: List[Dict[str, Any]] = []
+        if isinstance(payload.get("npc_pets"), list):
+            raw_items.extend([item for item in payload.get("npc_pets") or [] if isinstance(item, dict)])
+        elif isinstance(payload.get("npc_pet"), dict):
+            query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
+            raw_items.append({
+                "status": "ok",
+                "npc_pet": payload.get("npc_pet"),
+                "pet_gid": query.get("pet_gid"),
+                "furniture_guid": query.get("npc_id") or query.get("furniture_guid"),
+                "npc_id_source": "query",
+            })
+
+        pets = []
+        for index, raw in enumerate(raw_items):
+            npc_pet = raw.get("npc_pet") if isinstance(raw.get("npc_pet"), dict) else {}
+            pet = npc_pet.get("pet") if isinstance(npc_pet.get("pet"), dict) else {}
+            status = str(raw.get("status") or ("ok" if pet else "unknown"))
+            variant_text, variant_icon = self._pet_data_variant(pet, raw)
+            base_id = pet.get("base_conf_id") or raw.get("pet_cfg_id") or pet.get("catch_base_id") or pet.get("conf_id")
+            wiki_pet_id = self._pet_data_wiki_pet_id(base_id)
+            size_info = self._pet_data_weight_size_info(pet, (size_lookup or {}).get(wiki_pet_id))
+            name = pet.get("name") or pet.get("pet_default_name") or raw.get("pet_default_name") or raw.get("name") or f"精灵 {base_id or index + 1}"
+            default_name = pet.get("pet_default_name") or raw.get("pet_default_name") or ""
+            display_default = default_name if default_name and default_name != name else ""
+            pet_gid = pet.get("gid") or raw.get("pet_gid")
+            furniture_guid = raw.get("furniture_guid") or (pet.get("scene_info") or {}).get("npc_id") if isinstance(pet.get("scene_info"), dict) else raw.get("furniture_guid")
+            pets.append({
+                "index": index + 1,
+                "status": status,
+                "statusText": "成功" if status == "ok" else status,
+                "retCode": self._pet_data_display(npc_pet.get("ret_code")),
+                "name": str(name),
+                "defaultName": str(display_default),
+                "level": self._pet_data_display(pet.get("level")),
+                "baseId": self._pet_data_display(base_id),
+                "confId": self._pet_data_display(pet.get("conf_id")),
+                "petGid": self._pet_data_display(pet_gid),
+                "npcId": self._pet_data_display(furniture_guid),
+                "npcIdSource": self._pet_data_display(raw.get("npc_id_source")),
+                "imageUrl": self._pet_data_image_url(base_id, "image"),
+                "iconUrl": self._pet_data_image_url(base_id, "icon"),
+                "variantText": variant_text,
+                "variantIcon": variant_icon,
+                "voiceText": self._pet_data_voice_text(pet.get("voice")),
+                "cards": self._pet_data_card_items(pet, option_maps, variant_text, size_info),
+                "attributes": self._pet_data_attributes(pet),
+                "skills": self._pet_data_skills(pet, skill_lookup, load_skill_icons=load_skill_icons),
+                "catchItems": [
+                    {"label": "捕捉等级", "value": self._pet_data_display(pet.get("catch_lv"))},
+                    {"label": "捕捉方式", "value": self._pet_data_display(pet.get("catch_way"))},
+                    {"label": "捕捉营地", "value": self._pet_data_display(pet.get("caught_camp"))},
+                    {"label": "获得时间", "value": self._pet_data_time_text(pet.get("add_time"))},
+                ],
+                "specialityIds": " / ".join(str(x) for x in (pet.get("real_speciality_ids") or [])) or self._pet_data_display(pet.get("speciality_id")),
+                "relationshipType": self._pet_data_display(npc_pet.get("relationship_type")),
+                "errorText": self._pet_data_display(raw.get("error") or raw.get("message") or npc_pet.get("error_message"), ""),
+            })
+        return pets
+
+    def _build_pet_data_render_data(
+        self,
+        res: Dict[str, Any] | None,
+        uid: str,
+        options: Dict[str, Any] | None = None,
+        skill_lookup: Dict[str, Dict[str, Any]] | None = None,
+        size_lookup: Dict[str, Dict[str, Any]] | None = None,
+        single_query: bool = False,
+        low_bandwidth_mode: bool = False,
+    ) -> Dict[str, Any]:
+        payload = res or {}
+        if isinstance(payload.get("result"), dict):
+            payload = payload.get("result") or payload
+        option_maps = self._pet_data_option_maps(options)
+        player_info = payload.get("player_info") if isinstance(payload.get("player_info"), dict) else {}
+        if not player_info and isinstance(payload.get("npc_pet"), dict):
+            player_info = payload["npc_pet"].get("player_info") if isinstance(payload["npc_pet"].get("player_info"), dict) else {}
+        pets = self._pet_data_extract_items(
+            payload,
+            option_maps,
+            skill_lookup,
+            size_lookup,
+            load_skill_icons=not low_bandwidth_mode,
+        )
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        finished_at = self._normalize_epoch_seconds(meta.get("finished_at") or meta.get("created_at"))
+        updated_at = datetime.fromtimestamp(finished_at, tz=self._cn_tz()).strftime("%Y-%m-%d %H:%M:%S") if finished_at else datetime.now(self._cn_tz()).strftime("%Y-%m-%d %H:%M:%S")
+        online = player_info.get("online")
+        online_text = "在线" if online is True else ("离线" if online is False else "未知")
+        ok_count = payload.get("npc_pet_ok_count")
+        error_count = payload.get("npc_pet_error_count")
+        skipped_count = payload.get("npc_pet_skipped_count")
+        return {
+            "title": "家园详情",
+            "subtitle": "Ingame Pet Data",
+            "uid": self._pet_data_display(payload.get("uin") or player_info.get("uin") or uid),
+            "playerName": self._pet_data_display(player_info.get("name"), "未知玩家"),
+            "playerLevel": self._pet_data_display(player_info.get("level")),
+            "worldLevel": self._pet_data_display(player_info.get("world_level")),
+            "onlineText": online_text,
+            "isOnline": online is True,
+            "queryMode": "单只精灵" if single_query else "家园批量",
+            "lowBandwidthMode": low_bandwidth_mode,
+            "summaryCards": [
+                {"label": "目标状态", "value": online_text},
+                {"label": "返回精灵", "value": str(len(pets))},
+                {"label": "成功/失败", "value": f"{self._pet_data_display(ok_count, str(len(pets)))} / {self._pet_data_display(error_count, '0')}"},
+                {"label": "跳过", "value": self._pet_data_display(skipped_count, "0")},
+            ],
+            "pets": pets,
+            "updatedAt": updated_at,
+            "notice": "该接口依赖目标玩家在线且家园可访问；离线或隐私/上游不可达时可能失败。",
+            "emptyText": "未获取到家园精灵完整数据。请确认目标玩家在线、家园可访问，或稍后重试。",
+            "commandHint": "💡 /家园详情 <UID> | /家园详情 <UID> <pet_gid> <npc_id>",
+            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+        }
+
     async def _home_subscription_loop(self):
         logger.info("[Rocom] 家园订阅循环任务已启动")
         interval = max(1, int(self.home_subscription_interval_minutes or 5)) * 60
@@ -682,6 +1401,17 @@ class RocomPlugin(Star):
             names = [f"田地{item.get('landIndex')} {item.get('plantName')}" for item in ready_items]
             return items, ready_items, unit, names
 
+        if kind == "egg":
+            items = [
+                item
+                for item in list(data.get("indoorPets") or []) + list(data.get("guardPets") or [])
+                if item.get("eggTime")
+            ]
+            ready_items = [item for item in items if item.get("eggReady")]
+            unit = "生蛋"
+            names = [item.get("name", "未知精灵") for item in ready_items]
+            return items, ready_items, unit, names
+
         items = [
             item
             for item in list(data.get("indoorPets") or []) + list(data.get("guardPets") or [])
@@ -701,8 +1431,12 @@ class RocomPlugin(Star):
         ready_items: List[Dict[str, Any]],
         names: List[str],
     ) -> str:
-        kind_text = "菜园作物" if kind == "garden" else "精灵灵感"
-        action_text = "成熟" if kind == "garden" else "完成"
+        text_map = {
+            "garden": ("菜园作物", "成熟"),
+            "inspiration": ("精灵灵感", "完成"),
+            "egg": ("精灵生蛋", "可领取"),
+        }
+        kind_text, action_text = text_map.get(kind, ("家园项目", "完成"))
         level_text = "首个" if level == "first" else "全部"
         title = f"家园{kind_text}{level_text}{action_text}提醒"
         lines = [
@@ -746,7 +1480,7 @@ class RocomPlugin(Star):
         for key, sub in all_subs.items():
             uid = str(sub.get("uid", "") or "")
             kind = str(sub.get("kind", "") or "")
-            if not uid or kind not in {"garden", "inspiration"}:
+            if not uid or kind not in {"garden", "inspiration", "egg"}:
                 continue
             if uid not in data_cache:
                 data_cache[uid] = await self.client.ingame_home_info(uid)
@@ -832,6 +1566,382 @@ class RocomPlugin(Star):
             return default_times
         parsed.sort(key=lambda x: (x[0], x[1]))
         return parsed
+    def _announcement_id(self, item: Dict[str, Any] | None) -> str:
+        item = item or {}
+        return str(item.get("thread_id") or item.get("id") or "").strip()
+
+    def _announcement_ts(self, item: Dict[str, Any] | None) -> int:
+        item = item or {}
+        for key in ("published_at_ts", "publish_at_ts", "created_at_ts"):
+            try:
+                value = int(item.get(key) or 0)
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+        for key in ("publishAt", "published_at", "createdAt"):
+            text = str(item.get(key) or "").strip()
+            if not text:
+                continue
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+                try:
+                    return int(datetime.strptime(text, fmt).timestamp())
+                except ValueError:
+                    continue
+        return 0
+
+    def _announcement_images(self, item: Dict[str, Any] | None) -> List[str]:
+        images = []
+        content = (item or {}).get("content") if isinstance((item or {}).get("content"), dict) else {}
+        for index in content.get("indexes") or []:
+            if not isinstance(index, dict):
+                continue
+            for field in ("imageUrl", "imagePreviewUrl"):
+                value = index.get(field)
+                if isinstance(value, list):
+                    images.extend([str(url) for url in value if url])
+                elif value:
+                    images.append(str(value))
+        cover = (item or {}).get("cover")
+        if cover:
+            images.insert(0, str(cover))
+        seen = set()
+        result = []
+        for url in images:
+            if url in seen:
+                continue
+            seen.add(url)
+            result.append(url)
+        return result
+
+    def _build_announcement_list_render_data(self, res: Dict[str, Any] | None) -> Dict[str, Any]:
+        items = (res or {}).get("list") or (res or {}).get("items") or []
+        cards = []
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            cards.append(
+                {
+                    "index": index,
+                    "id": self._announcement_id(item),
+                    "title": item.get("title", "未命名公告"),
+                    "summary": item.get("summary") or "",
+                    "cover": item.get("cover") or "",
+                    "time": item.get("publishAt") or item.get("published_at") or item.get("createdAt") or "",
+                    "author": ((item.get("author") or {}).get("nickname") if isinstance(item.get("author"), dict) else "") or "洛克王国：世界",
+                    "isStick": bool(item.get("isStick")),
+                }
+            )
+        page = (res or {}).get("page", 1)
+        total_text = (res or {}).get("total") or (res or {}).get("count") or "未知"
+        return {
+            "title": "洛克王国公告",
+            "subtitle": f"第 {page} 页 · 本页 {len(cards)} 条",
+            "cards": cards,
+            "listHeader": "洛克王国公告",
+            "listSubtitle": f"共 {total_text} 条公告，本页显示 {len(cards)} 条",
+            "list": [
+                {
+                    "index": item["index"],
+                    "id": item["id"],
+                    "title": item["title"],
+                    "timeStr": item["time"],
+                    "coverUrl": item["cover"],
+                    "summary": item["summary"],
+                    "author": item["author"],
+                    "isStick": item["isStick"],
+                }
+                for item in cards
+            ],
+            "has_more": bool((res or {}).get("has_more")),
+            "next_page": (res or {}).get("next_page"),
+            "commandHint": "💡 /洛克公告 <页码> | /洛克公告详情 <公告ID> | /洛克公告最新",
+            "footerLine1": "由 AstrBot & WeGame Locke Kingdom Plugin 渲染",
+            "pageWidth": 680,
+        }
+
+    def _build_announcement_detail_render_data(self, item: Dict[str, Any] | None) -> Dict[str, Any]:
+        item = item or {}
+        content = item.get("content") if isinstance(item.get("content"), dict) else {}
+        caption_html = content.get("text") or item.get("summary") or "该公告暂无正文。"
+        return {
+            "title": item.get("title", "洛克王国公告"),
+            "summary": item.get("summary") or "",
+            "cover": item.get("cover") or "",
+            "coverUrl": item.get("cover") or "",
+            "time": item.get("publishAt") or item.get("published_at") or item.get("createdAt") or "",
+            "timeLabel": "发布时间：",
+            "timeStr": item.get("publishAt") or item.get("published_at") or item.get("createdAt") or "",
+            "author": ((item.get("author") or {}).get("nickname") if isinstance(item.get("author"), dict) else "") or "洛克王国：世界",
+            "content_html": content.get("text") or "",
+            "captionHtml": caption_html,
+            "images": self._announcement_images(item),
+            "stats": [
+                {"label": "浏览", "value": item.get("viewCount", 0)},
+                {"label": "收藏", "value": item.get("collectCount", 0)},
+                {"label": "分享", "value": item.get("shareCount", 0)},
+            ],
+            "commandHint": "💡 /订阅洛克公告 可订阅新公告推送",
+            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            "pageWidth": 760,
+        }
+
+    def _activity_ts(self, value: Any, fallback_date: str = "", end_of_day: bool = False) -> int:
+        try:
+            raw = int(float(value))
+            if raw > 10_000_000_000:
+                raw = raw // 1000
+            if raw > 0:
+                return raw
+        except (TypeError, ValueError):
+            pass
+
+        text = str(value or fallback_date or "").strip()
+        if not text:
+            return 0
+        formats = (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+        )
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(text, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=self._cn_tz())
+                if fmt == "%Y-%m-%d" and end_of_day:
+                    dt = dt.replace(hour=23, minute=59, second=59)
+                return int(dt.timestamp())
+            except ValueError:
+                continue
+        return 0
+
+    def _activity_time_text(self, ts: int, with_time: bool = False) -> str:
+        if not ts:
+            return "--"
+        fmt = "%m.%d %H:%M" if with_time else "%m.%d"
+        return datetime.fromtimestamp(ts, tz=self._cn_tz()).strftime(fmt)
+
+    def _activity_rewards_text(self, act: Dict[str, Any]) -> str:
+        names: List[str] = []
+        for key in ("get_props", "get_extra_props", "get_pets"):
+            value = act.get(key)
+            if not isinstance(value, list):
+                continue
+            for item in value[:4]:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("goods_name") or item.get("pet_name") or item.get("title")
+                    if name:
+                        names.append(str(name))
+                elif item:
+                    names.append(str(item))
+        return "、".join(names[:6]) if names else "暂无奖励信息"
+
+    def _extract_activity_items(self, res: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+        payload = res or {}
+        source = []
+        for key in ("activityCalendar", "calendar", "otherActivities", "activities", "list", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                source = value
+                break
+        if not source and isinstance(payload.get("data"), dict):
+            return self._extract_activity_items(payload.get("data"))
+
+        now_ts = int(time.time())
+        result = []
+        for act in source:
+            if not isinstance(act, dict) or act.get("is_deleted"):
+                continue
+            start_ts = self._activity_ts(
+                act.get("start_time")
+                or act.get("startAt")
+                or act.get("start_at")
+                or act.get("start_ts"),
+                act.get("start_date") or "",
+            )
+            end_ts = self._activity_ts(
+                act.get("end_time")
+                or act.get("endAt")
+                or act.get("end_at")
+                or act.get("end_ts"),
+                act.get("end_date") or "",
+                end_of_day=True,
+            )
+            is_unlimited = bool(act.get("is_unlimited"))
+            if not start_ts and not end_ts and not is_unlimited:
+                continue
+            if is_unlimited and not end_ts:
+                end_ts = start_ts + 365 * 86400 if start_ts else now_ts + 365 * 86400
+            if not start_ts:
+                start_ts = now_ts
+            if not end_ts or end_ts <= start_ts:
+                end_ts = start_ts + 86400
+
+            if now_ts < start_ts:
+                status_text = "未开始"
+                status_class = "upcoming"
+            elif now_ts > end_ts and not is_unlimited:
+                status_text = "已结束"
+                status_class = "ended"
+            else:
+                status_text = "进行中" if not is_unlimited else "常驻"
+                status_class = "active" if not is_unlimited else "permanent"
+
+            result.append(
+                {
+                    "name": str(act.get("name") or act.get("title") or "未命名活动"),
+                    "desc": str(act.get("description") or act.get("desc") or "活动"),
+                    "cover": str(act.get("cover_url") or act.get("cover") or act.get("pic") or ""),
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "start": self._activity_time_text(start_ts, with_time=True),
+                    "end": self._activity_time_text(end_ts, with_time=True),
+                    "statusText": status_text,
+                    "statusClass": status_class,
+                    "is_perm": is_unlimited or (end_ts - start_ts >= 300 * 86400),
+                    "rewards": self._activity_rewards_text(act),
+                    "sort": int(act.get("sort") or 999),
+                }
+            )
+        return sorted(result, key=lambda x: (x["is_perm"], x["start_ts"], x["sort"]))
+
+    def _build_activity_calendar_render_data(self, res: Dict[str, Any] | None) -> Dict[str, Any]:
+        items = self._extract_activity_items(res)
+        now = datetime.now(self._cn_tz())
+        now_ts = int(now.timestamp())
+        today_midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=self._cn_tz())
+        min_ts = int(today_midnight.timestamp()) - 10 * 86400
+        max_ts = int(today_midnight.timestamp()) + 50 * 86400
+        total_duration = max(max_ts - min_ts, 1)
+
+        normal_items = []
+        permanent_items = []
+        key_dates = set()
+        for item in items:
+            left_pct = (item["start_ts"] - min_ts) / total_duration * 100
+            right_pct = (item["end_ts"] - min_ts) / total_duration * 100
+            if item["is_perm"]:
+                right_pct = 100
+            left_pct = max(0, min(100, left_pct))
+            right_pct = max(0, min(100, right_pct))
+            width_pct = max(12.5, right_pct - left_pct)
+            if left_pct + width_pct > 100:
+                left_pct = max(0, 100 - width_pct)
+            item["left_pct"] = round(left_pct, 3)
+            item["width_pct"] = round(width_pct, 3)
+            item["hide_start"] = item["start_ts"] < min_ts
+            if item["is_perm"]:
+                permanent_items.append(item)
+            else:
+                normal_items.append(item)
+                if min_ts <= item["start_ts"] <= max_ts:
+                    key_dates.add(item["start_ts"])
+
+        def pack_lanes(source: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+            lanes: List[List[Dict[str, Any]]] = []
+            for item in source:
+                placed = False
+                for lane in lanes:
+                    if item["start_ts"] >= lane[-1]["end_ts"] + 86400:
+                        lane.append(item)
+                        placed = True
+                        break
+                if not placed:
+                    lanes.append([item])
+            return lanes
+
+        lanes = pack_lanes(normal_items) + pack_lanes(permanent_items)
+        axis_dates = []
+        last_ts = 0
+        for ts in sorted(key_dates):
+            if ts - last_ts < 4 * 86400:
+                continue
+            last_ts = ts
+            axis_dates.append(
+                {
+                    "label": self._activity_time_text(ts),
+                    "left_pct": round((ts - min_ts) / total_duration * 100, 3),
+                }
+            )
+
+        now_pct = (now_ts - min_ts) / total_duration * 100
+        now_line = (
+            {"label": "TODAY", "left_pct": round(now_pct, 3)}
+            if 0 <= now_pct <= 100
+            else None
+        )
+
+        return {
+            "title": "洛克活动日历",
+            "subtitle": f"显示 {now.strftime('%m.%d')} 前 10 天至后 50 天活动",
+            "lanes": lanes,
+            "axis_dates": axis_dates,
+            "now_line": now_line,
+            "empty": not bool(items),
+            "commandHint": "💡 /洛克活动日历",
+            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+        }
+
+    async def _announcement_subscription_loop(self):
+        logger.info("[Rocom] 公告订阅循环任务已启动")
+        interval = max(1, int(self.announcement_poll_interval_minutes or 10)) * 60
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._check_announcement_subscriptions()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[Rocom] 公告订阅循环异常: {e}")
+                await asyncio.sleep(60)
+
+    async def _check_announcement_subscriptions(self):
+        all_subs = await self.announcement_sub_mgr.get_all_subscriptions()
+        if not all_subs:
+            return
+        latest = await self.client.get_announcement_latest()
+        if not latest:
+            return
+        latest_id = self._announcement_id(latest)
+        latest_ts = self._announcement_ts(latest)
+        if not latest_id:
+            return
+        detail = None
+        img_url = None
+        for key, sub in all_subs.items():
+            last_id = str(sub.get("last_id") or "")
+            last_ts = int(sub.get("since_ts") or 0)
+            if latest_id == last_id:
+                continue
+            if latest_ts and last_ts and latest_ts <= last_ts:
+                continue
+            if detail is None:
+                detail = await self.client.get_announcement_detail(latest_id) or latest
+                img_url = await self.renderer.render_html(
+                    "render/announcement/detail.html",
+                    self._build_announcement_detail_render_data(detail),
+                    {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
+                )
+            chain = MessageChain().message(
+                f"【洛克王国新公告】\n{latest.get('title', '未命名公告')}\n"
+            )
+            if img_url:
+                chain.file_image(img_url)
+            elif latest.get("summary"):
+                chain.message(str(latest.get("summary")))
+            try:
+                await self.context.send_message(sub["umo"], chain)
+            except Exception as e:
+                logger.warning(f"[Rocom] 公告订阅推送失败: {e}")
+                continue
+            sub["last_id"] = latest_id
+            sub["since_ts"] = latest_ts or int(time.time())
+            sub["updated_at"] = int(time.time())
+            await self.announcement_sub_mgr.upsert_subscription(key, sub)
+            await asyncio.sleep(2)
 
     def _merchant_check_times(self, base: datetime | None = None) -> List[datetime]:
         now = base or datetime.now(self._cn_tz())
@@ -866,7 +1976,7 @@ class RocomPlugin(Star):
         return random.uniform(0, self._merchant_jitter_seconds)
 
     async def _merchant_subscription_loop(self):
-        logger.info("[Rocom] 远行商人订阅循环任务已启动")
+        logger.info(f"[Rocom] 远行商人订阅循环任务已启动（instance={self._instance_id}）")
         while True:
             try:
                 now = datetime.now(self._cn_tz())
@@ -1259,216 +2369,1932 @@ class RocomPlugin(Star):
         # 只有当 items 非空时才返回，否则返回 None 表示使用默认配置
         return mention, items if items else None
 
-    def _wiki_asset_id(self, number: Any) -> int | None:
-        try:
-            numeric_id = int(number)
-        except (TypeError, ValueError):
-            return None
-        return numeric_id if numeric_id >= 3000 else numeric_id + 3000
-
-    def _wiki_pet_icon(self, item: Dict[str, Any]) -> str:
-        icon_url = item.get("icon_url") or item.get("pet_icon") or item.get("petIcon")
-        if icon_url:
-            return icon_url
-        asset_id = self._wiki_asset_id(item.get("no") or item.get("pet_id"))
-        if asset_id is None:
-            return "{{_res_path}}img/roco_icon.png"
-        return f"https://game.gtimg.cn/images/rocom/rocodata/jingling/{asset_id}/icon.png"
-
-    def _wiki_pet_image(self, item: Dict[str, Any]) -> str:
-        image_url = item.get("image_url") or item.get("pet_image") or item.get("petImage")
-        if image_url:
-            return image_url
-        asset_id = self._wiki_asset_id(item.get("no") or item.get("pet_id"))
-        if asset_id is None:
-            return "{{_res_path}}img/roco_icon.png"
-        return f"https://game.gtimg.cn/images/rocom/rocodata/jingling/{asset_id}/image.png"
-
-    def _normalize_wiki_type_values(self, values: Any) -> List[str]:
-        normalized = []
-        for value in values or []:
-            if isinstance(value, dict):
-                text = value.get("name") or value.get("label") or value.get("value")
-            else:
-                text = value
-            if text:
-                normalized.append(str(text))
-        return normalized
-
-    def _build_wiki_evolution_data(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
-        raw_chain = (
-            item.get("evolution_chain")
-            or item.get("evolutionChain")
-            or item.get("evolutions")
-            or item.get("evolution")
-            or []
-        )
-        chain = []
-        for evo in raw_chain:
-            evo_name = evo.get("name") or evo.get("pet_name") or "未知形态"
-            evo_number = evo.get("no") or evo.get("pet_id") or item.get("no")
-            evo_asset_id = self._wiki_asset_id(evo_number)
-            evo_image = (
-                evo.get("image")
-                or evo.get("image_url")
-                or evo.get("petImage")
-                or (
-                    f"https://game.gtimg.cn/images/rocom/rocodata/jingling/{evo_asset_id}/image.png"
-                    if evo_asset_id is not None
-                    else self._wiki_pet_image(item)
-                )
-            )
-            evo_icon = (
-                evo.get("icon")
-                or evo.get("icon_url")
-                or evo.get("petIcon")
-                or (
-                    f"https://game.gtimg.cn/images/rocom/rocodata/jingling/{evo_asset_id}/icon.png"
-                    if evo_asset_id is not None
-                    else self._wiki_pet_icon(item)
-                )
-            )
-            chain.append(
-                {
-                    "name": evo_name,
-                    "number": evo_number or "?",
-                    "image": evo_image,
-                    "icon": evo_icon,
-                    "condition": evo.get("condition") or evo.get("how") or evo.get("requirement") or "",
-                    "is_current": bool(
-                        evo.get("is_current")
-                        or evo_name == item.get("name")
-                        or evo_number == item.get("no")
-                    ),
-                }
-            )
-        if chain:
-            return chain
-        return [
-            {
-                "name": item.get("name", "未知精灵"),
-                "number": item.get("no", "?"),
-                "image": self._wiki_pet_image(item),
-                "icon": self._wiki_pet_icon(item),
-                "condition": "",
-                "is_current": True,
-            }
-        ]
-
-    def _build_wiki_render_data(self, item: Dict[str, Any], query: str):
-        stats = item.get("stats") or {}
-        stat_defs = [
-            ("HP", "hp", "#4bc074"),
-            ("攻击", "atk", "#e95f5f"),
-            ("魔攻", "sp_atk", "#6f85ff"),
-            ("防御", "def", "#da9c37"),
-            ("魔抗", "sp_def", "#18a1a1"),
-            ("速度", "spd", "#9b61ff"),
-        ]
-        pet_stats = [
-            {"label": label, "value": int(stats.get(key, 0) or 0), "color": color}
-            for label, key, color in stat_defs
-        ]
-        ability_name = item.get("ability_name") or item.get("ability") or "暂无"
-        ability_desc = item.get("ability_desc") or item.get("ability_description") or "暂无特性描述"
-        pet_types = [{"name": attr} for attr in self._normalize_wiki_type_values(item.get("attributes") or item.get("types"))]
-        sprite_skills = []
-        skills = item.get("skills") or item.get("skill_list") or []
-        for skill in skills[:24]:
-            sprite_skills.append(
-                {
-                    "name": skill.get("name", "未知技能"),
-                    "type": skill.get("attribute", "未知"),
-                    "category": skill.get("category", "未知"),
-                    "power": skill.get("power", "?"),
-                    "pp": skill.get("cost", "?"),
-                    "effect": skill.get("description", "暂无描述"),
-                    "level": skill.get("level", "-"),
-                }
-            )
-        matchup = item.get("type_matchup") or {}
-        traits = [
-            {"name": ability_name, "type": "特性", "effect": ability_desc, "type_class": "ability"}
-        ]
-        matchup_defs = [
-            ("克制", "strong_against"),
-            ("被克制", "weak_to"),
-            ("抗性", "resists"),
-            ("被抗", "resisted_by"),
-        ]
-        for label, key in matchup_defs:
-            values = self._normalize_wiki_type_values(matchup.get(key))
-            traits.append(
-                {
-                    "name": label,
-                    "type": "属性",
-                    "effect": "、".join(values) if values else "暂无",
-                    "type_class": "matchup",
-                }
-            )
-        description = (
-            item.get("description")
-            or item.get("summary")
-            or item.get("intro")
-            or item.get("profile")
-            or ability_desc
-            or "暂无图鉴描述"
-        )
-        return {
-            "name": item.get("name", query),
-            "number": item.get("no", "???"),
-            "query": query,
-            "form": item.get("form", ""),
-            "pet_types": pet_types,
-            "pet_icon": self._wiki_pet_icon(item),
-            "main_image": self._wiki_pet_image(item),
-            "total_stats": int(stats.get("total", 0) or sum(x["value"] for x in pet_stats)),
-            "pet_stats": pet_stats,
-            "description": description,
-            "pet_traits": traits,
-            "pet_evolution": self._build_wiki_evolution_data(item),
-            "sprite_skills": sprite_skills,
-            "updated_at": item.get("updated_at", ""),
-            "wiki_url": item.get("url", ""),
-            "commandHint": "💡 /洛克wiki <精灵名> | /洛克技能 <技能名>",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
-        }
-
-
-    def _build_skill_render_data(self, item: Dict[str, Any], query: str):
-        power = item.get("power")
-        cost = item.get("cost")
-        return {
-            "name": item.get("name", query),
-            "query": query,
-            "attribute": item.get("attribute", "unknown"),
-            "category": item.get("category", "unknown"),
-            "cost": cost if cost not in (None, "") else "?",
-            "power": power if power not in (None, "") else "?",
-            "description": item.get("description", "No description"),
-            "updated_at": item.get("updated_at", ""),
-            "commandHint": "/洛克技能 <技能名>",
-            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
-        }
-
     def _normalize_query_text(self, text: str) -> str:
         return re.sub(r"\s+", "", str(text or "")).strip().lower()
 
-    def _find_exact_skill_match(self, results: List[Dict[str, Any]], query: str) -> Dict[str, Any] | None:
+    def _wiki_text(self, value: Any, default: str = "") -> str:
+        if value in (None, ""):
+            return default
+        return str(value)
+
+    def _wiki_named_value(self, value: Any) -> str:
+        if isinstance(value, dict):
+            return str(value.get("name") or value.get("label") or value.get("value") or "")
+        return str(value or "")
+
+    def _wiki_names(self, values: Any) -> List[str]:
+        if not values:
+            return []
+        if not isinstance(values, list):
+            values = [values]
+        result = []
+        for value in values:
+            text = self._wiki_named_value(value).strip()
+            if text:
+                result.append(text)
+        return result
+
+    def _find_exact_wiki_match(self, results: List[Dict[str, Any]], query: str) -> Dict[str, Any] | None:
         normalized_query = self._normalize_query_text(query)
         if not normalized_query:
             return None
         for item in results:
-            name = item.get("name", "")
-            form = item.get("form", "")
+            name = str(item.get("name") or "")
+            form = str(item.get("form") or "")
             candidates = [
                 self._normalize_query_text(name),
                 self._normalize_query_text(f"{name}{form}"),
                 self._normalize_query_text(f"{name} {form}"),
+                self._normalize_query_text(f"{form}{name}"),
             ]
             if normalized_query in candidates:
                 return item
         return None
+
+    def _wiki_candidate_text(self, query: str, items: List[Dict[str, Any]], kind: str) -> str:
+        lines = [f"找到多个{kind}候选，请使用更精确名称："]
+        for idx, item in enumerate(items[:10], 1):
+            name = item.get("name") or "未知"
+            form = item.get("form") or ""
+            item_id = item.get("pet_id") or item.get("skill_id") or item.get("id") or "-"
+            suffix = f"（{form}）" if form and form != "普通" else ""
+            lines.append(f"{idx}. {name}{suffix} #{item_id}")
+        lines.append(f"\n你查询的是：{query}")
+        return "\n".join(lines)
+
+    def _wiki_range_label(self, data: Dict[str, Any] | None, key_min: str, key_max: str, unit: str) -> str:
+        if not isinstance(data, dict):
+            return "暂无"
+        low = data.get(key_min)
+        high = data.get(key_max)
+        if low in (None, "") and high in (None, ""):
+            return "暂无"
+        if low in (None, ""):
+            return f"{high}{unit}"
+        if high in (None, "") or low == high:
+            return f"{low}{unit}"
+        return f"{low}-{high}{unit}"
+
+    def _wiki_body_size(self, *sources: Dict[str, Any]) -> Dict[str, str]:
+        body_size = {}
+        for source in sources:
+            if isinstance(source, dict) and isinstance(source.get("body_size"), dict):
+                body_size = source.get("body_size") or {}
+                break
+        height = body_size.get("height") if isinstance(body_size, dict) else {}
+        weight = body_size.get("weight") if isinstance(body_size, dict) else {}
+        return {
+            "height": self._wiki_range_label(height, "min_m", "max_m", "m"),
+            "weight": self._wiki_range_label(weight, "min_kg", "max_kg", "kg"),
+        }
+
+    def _wiki_gender_label(self, value: Any) -> str:
+        if isinstance(value, dict):
+            male = value.get("male_percent")
+            female = value.get("female_percent")
+            parts = []
+            if male not in (None, ""):
+                parts.append(f"雄 {male}%")
+            if female not in (None, ""):
+                parts.append(f"雌 {female}%")
+            return " / ".join(parts) if parts else "暂无"
+        return str(value or "暂无")
+
+    def _wiki_ecology_label(self, value: Any, fallback: Any = "") -> str:
+        if isinstance(value, dict):
+            parts = []
+            for key in ("pet_text", "pet_style"):
+                text = str(value.get(key) or "").strip()
+                if text:
+                    parts.append(text)
+            habitats = self._wiki_names(value.get("habitats"))
+            if habitats:
+                parts.append("栖息：" + " / ".join(habitats))
+            return "；".join(parts)
+        text = str(value or fallback or "").strip()
+        return text
+
+    def _wiki_source_label(self, source: Any, fallback: Any = "") -> str:
+        mapping = {
+            "level": "升级",
+            "machine": "技能石",
+            "blood": "血脉",
+            "field": "特殊来源",
+        }
+        text = str(source or "").strip()
+        return str(fallback or mapping.get(text, text) or "")
+
+    def _wiki_type_effectiveness(self, profile: Dict[str, Any]) -> List[Dict[str, str]]:
+        data = profile.get("type_effectiveness") if isinstance(profile, dict) else {}
+        if not isinstance(data, dict):
+            return []
+        rows = []
+        definitions = [
+            ("攻击克制", ("attack", "strong")),
+            ("攻击弱效", ("attack", "weak")),
+            ("防御弱点", ("defense", "weak")),
+            ("防御抵抗", ("defense", "resist")),
+        ]
+        for label, (group_key, item_key) in definitions:
+            group = data.get(group_key) if isinstance(data.get(group_key), dict) else {}
+            names = self._wiki_names(group.get(item_key) if isinstance(group, dict) else [])
+            if names:
+                rows.append({"label": label, "value": " / ".join(names)})
+        return rows
+
+    def _build_pet_stats(self, profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+        attrs = profile.get("attributes") if isinstance(profile, dict) else {}
+        attrs = attrs if isinstance(attrs, dict) else {}
+        defs = [
+            ("精力", "hp", "#42b883"),
+            ("物攻", "physical_attack", "#e86452"),
+            ("魔攻", "magic_attack", "#5987f5"),
+            ("物防", "physical_defense", "#d69a32"),
+            ("魔防", "magic_defense", "#25a6a6"),
+            ("速度", "speed", "#8d62d9"),
+        ]
+        return [
+            {
+                "label": label,
+                "value": int(attrs.get(key) or 0),
+                "color": color,
+                "percent": min(int(attrs.get(key) or 0) / 160 * 100, 100),
+            }
+            for label, key, color in defs
+        ]
+
+    def _build_pet_skill_groups(self, skills_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        groups = []
+        source_defs = [
+            ("level", "升级习得"),
+            ("machine", "技能机"),
+            ("blood", "血脉技能"),
+            ("field", "场景习得"),
+        ]
+        for key, label in source_defs:
+            raw_items = []
+            if isinstance(skills_data, dict):
+                value = skills_data.get(key)
+                if isinstance(value, list):
+                    raw_items = value
+            items = []
+            for skill in raw_items[:10]:
+                items.append(
+                    {
+                        "name": skill.get("name") or "未知技能",
+                        "icon": skill.get("icon") or "",
+                        "level": skill.get("level") or skill.get("source_label") or "",
+                        "type": self._wiki_named_value(skill.get("element_type") or skill.get("type")) or "未知",
+                        "category": self._wiki_named_value(skill.get("skill_type")) or self._wiki_named_value(skill.get("damage_type")) or "未知",
+                        "cost": skill.get("cost") if skill.get("cost") not in (None, "") else "?",
+                        "power": skill.get("power") if skill.get("power") not in (None, "") else "?",
+                        "desc": skill.get("desc") or skill.get("description") or skill.get("flavor_text") or "暂无说明",
+                    }
+                )
+            if items:
+                groups.append({"label": label, "items": items})
+        return groups
+
+    def _build_pet_family(self, family_data: Dict[str, Any], current_id: Any) -> List[Dict[str, Any]]:
+        items = []
+        if isinstance(family_data, dict):
+            if isinstance(family_data.get("members"), list):
+                items.extend(family_data.get("members") or [])
+            for form_group in family_data.get("forms") or []:
+                for member in form_group.get("members") or []:
+                    merged = dict(member)
+                    if form_group.get("name") and not merged.get("form_group"):
+                        merged["form_group"] = form_group.get("name")
+                    items.append(merged)
+            if not items:
+                for key in ("items", "family", "evolutions"):
+                    value = family_data.get(key)
+                    if isinstance(value, list):
+                        items.extend(value)
+                        break
+        elif isinstance(family_data, list):
+            items = family_data
+        result = []
+        seen = set()
+        for item in items[:12]:
+            pet_id = item.get("pet_id") or item.get("id")
+            key = str(pet_id or item.get("name") or "")
+            if key and key in seen:
+                continue
+            seen.add(key)
+            condition_texts = item.get("condition_texts") if isinstance(item.get("condition_texts"), list) else []
+            result.append(
+                {
+                    "pet_id": pet_id or "-",
+                    "name": item.get("name") or "未知精灵",
+                    "form": item.get("form") or item.get("form_group") or "",
+                    "icon": item.get("icon") or item.get("small_icon") or "",
+                    "condition": item.get("condition_summary")
+                    or " / ".join(str(x) for x in condition_texts if x)
+                    or item.get("evolution_description")
+                    or item.get("condition")
+                    or item.get("evolve_condition")
+                    or item.get("relation")
+                    or "",
+                    "is_current": str(pet_id or "") == str(current_id or ""),
+                }
+            )
+        return result
+
+    def _build_handbook_topics(self, handbook_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        topics = handbook_data.get("topics") if isinstance(handbook_data, dict) else []
+        result = []
+        for item in (topics or [])[:8]:
+            rewards = []
+            reward_items = item.get("rewards") or item.get("reward_items")
+            reward = item.get("reward")
+            if not reward_items and isinstance(reward, dict):
+                reward_items = reward.get("items")
+            for reward in reward_items or []:
+                rewards.append(
+                    {
+                        "name": reward.get("name") or "奖励",
+                        "count": reward.get("count") or "",
+                        "icon": reward.get("icon") or "",
+                    }
+                )
+            result.append(
+                {
+                    "name": item.get("name") or item.get("title") or f"课题 {item.get('topic_id') or ''}".strip(),
+                    "desc": item.get("description") or item.get("desc") or "",
+                    "rewards": rewards[:4],
+                }
+            )
+        return result
+
+    async def _resolve_wiki_pet(self, query: str) -> tuple[Dict[str, Any] | None, List[Dict[str, Any]], str]:
+        query = str(query or "").strip()
+        if not query:
+            return None, [], "请输入精灵名称或 ID。用法：/洛克wiki 精灵 <精灵名或ID>"
+        if query.isdigit():
+            detail = await self.client.get_wiki_pet(query)
+            if detail:
+                return detail, [], ""
+            return None, [], f"获取 Wiki 精灵详情失败：{self.client.get_last_error()}"
+        search_res = await self.client.list_wiki_pets(q=query, page_no=1, page_size=10)
+        items = (search_res or {}).get("items") or []
+        if not items:
+            suggestions = await self._wiki_suggest_catalog_items(await self._get_wiki_catalog_by_key("pets"), query, 10)
+            if suggestions:
+                return None, suggestions, ""
+            return None, [], f"未找到「{query}」的 Wiki 精灵资料：{self.client.get_last_error('无匹配结果')}"
+        selected = self._find_exact_wiki_match(items, query)
+        if selected is None and len(items) == 1:
+            selected = items[0]
+        if selected is None:
+            return None, items, ""
+        detail = await self.client.get_wiki_pet(selected.get("pet_id"))
+        if detail:
+            return detail, [], ""
+        return None, [], f"获取 Wiki 精灵详情失败：{self.client.get_last_error()}"
+
+    async def _resolve_wiki_skill(self, query: str) -> tuple[Dict[str, Any] | None, List[Dict[str, Any]], str]:
+        query = str(query or "").strip()
+        if not query:
+            return None, [], "请输入技能名称或 ID。用法：/洛克wiki 技能 <技能名或ID>"
+        if query.isdigit():
+            detail = await self.client.get_wiki_skill(query)
+            if detail:
+                return detail, [], ""
+            return None, [], f"获取技能详情失败：{self.client.get_last_error()}"
+        search_res = await self.client.list_wiki_skills(q=query, page_no=1, page_size=10)
+        items = (search_res or {}).get("items") or []
+        if not items:
+            suggestions = await self._wiki_suggest_catalog_items(await self._get_wiki_catalog_by_key("skills"), query, 10)
+            if suggestions:
+                return None, suggestions, ""
+            return None, [], f"未找到「{query}」的技能 Wiki 资料：{self.client.get_last_error('无匹配结果')}。用法：/洛克wiki 技能 <技能名或ID>"
+        selected = self._find_exact_wiki_match(items, query)
+        if selected is None and len(items) == 1:
+            selected = items[0]
+        if selected is None:
+            return None, items, ""
+        detail = await self.client.get_wiki_skill(selected.get("skill_id"))
+        if detail:
+            return detail, [], ""
+        return None, [], f"获取技能详情失败：{self.client.get_last_error()}"
+
+    async def _fetch_wiki_pet_sections(self, pet_id: Any) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        profile_res, skills_res, family_res, handbook_res = await asyncio.gather(
+            self.client.get_wiki_pet_profile(pet_id),
+            self.client.get_wiki_pet_skills(pet_id),
+            self.client.get_wiki_pet_family(pet_id),
+            self.client.get_wiki_pet_handbook(pet_id),
+            return_exceptions=True,
+        )
+        return (
+            profile_res if isinstance(profile_res, dict) else {},
+            skills_res if isinstance(skills_res, dict) else {},
+            family_res if isinstance(family_res, dict) else {},
+            handbook_res if isinstance(handbook_res, dict) else {},
+        )
+
+    def _build_wiki_render_data(
+        self,
+        overview: Dict[str, Any],
+        profile: Dict[str, Any] | None,
+        skills: Dict[str, Any] | None,
+        family: Dict[str, Any] | None,
+        handbook: Dict[str, Any] | None,
+        query: str,
+    ) -> Dict[str, Any]:
+        profile = profile or {}
+        skills = skills or {}
+        family = family or {}
+        handbook = handbook or {}
+        pet_id = overview.get("pet_id") or profile.get("pet_id")
+        type_names = self._wiki_names(overview.get("type_names") or overview.get("types"))
+        egg_groups = self._wiki_names(overview.get("egg_group_names") or overview.get("egg_groups"))
+        feature = overview.get("feature") or {}
+        body_size = self._wiki_body_size(profile, overview)
+        stats = self._build_pet_stats(profile)
+        total_stats = (profile.get("attributes") or {}).get("sum") or sum(item["value"] for item in stats)
+        return {
+            "name": overview.get("name") or profile.get("name") or query,
+            "query": query,
+            "pet_id": pet_id or "-",
+            "number": overview.get("handbook_no") or profile.get("handbook_no") or "---",
+            "form": overview.get("form") or profile.get("form") or "",
+            "quality": overview.get("quality") or profile.get("quality") or "",
+            "stage": overview.get("stage") or profile.get("stage") or "",
+            "pet_icon": overview.get("icon") or overview.get("small_icon") or "{{_res_path}}img/roco_icon.png",
+            "main_image": profile.get("small_icon") or overview.get("small_icon") or profile.get("icon") or overview.get("icon") or "{{_res_path}}img/roco_icon.png",
+            "type_names": type_names,
+            "egg_groups": egg_groups,
+            "description": profile.get("description") or overview.get("description") or "暂无图鉴描述",
+            "classis": self._wiki_named_value(overview.get("classis")) or "暂无",
+            "feature_name": feature.get("name") or "暂无",
+            "feature_desc": feature.get("desc") or "暂无特性说明",
+            "ride_talent": "支持" if overview.get("has_ride_talent") else "不支持",
+            "height_label": body_size["height"],
+            "weight_label": body_size["weight"],
+            "gender_ratio": self._wiki_gender_label(profile.get("gender_ratio")),
+            "move_type": profile.get("move_type") or "暂无",
+            "habitats": self._wiki_names(profile.get("habitats")),
+            "ecology": self._wiki_ecology_label(profile.get("ecology"), profile.get("pet_style")),
+            "type_effectiveness": self._wiki_type_effectiveness(profile),
+            "total_stats": total_stats,
+            "pet_stats": stats,
+            "skill_groups": self._build_pet_skill_groups(skills),
+            "family_members": self._build_pet_family(family, pet_id),
+            "handbook_topics": self._build_handbook_topics(handbook),
+            "areas": self._wiki_names(handbook.get("areas") if isinstance(handbook, dict) else []),
+            "commandHint": "💡 /洛克wiki <类型> <关键词或ID> | 示例：/洛克wiki 技能 圣光斩",
+            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+        }
+
+    def _build_skill_render_data(
+        self,
+        item: Dict[str, Any],
+        pets_data: Dict[str, Any] | None,
+        query: str,
+    ) -> Dict[str, Any]:
+        pets = []
+        for pet in ((pets_data or {}).get("items") or [])[:30]:
+            pets.append(
+                {
+                    "name": pet.get("name") or "未知精灵",
+                    "pet_id": pet.get("pet_id") or "-",
+                    "icon": pet.get("icon") or pet.get("small_icon") or "",
+                    "source": self._wiki_source_label(pet.get("source"), pet.get("source_label")),
+                    "level": pet.get("level") or "",
+                }
+            )
+        tags = []
+        for tag in item.get("tags") or []:
+            tags.append({"name": tag.get("name") or "", "icon": tag.get("icon") or ""})
+        return {
+            "name": item.get("name") or query,
+            "skill_id": item.get("skill_id") or "-",
+            "query": query,
+            "icon": item.get("icon") or "",
+            "type": self._wiki_named_value(item.get("type")) or "未知",
+            "skill_type": self._wiki_named_value(item.get("skill_type")) or "未知",
+            "damage_type": self._wiki_named_value(item.get("damage_type")) or "未知",
+            "element_type": self._wiki_named_value(item.get("element_type")) or "未知",
+            "cost": item.get("cost") if item.get("cost") not in (None, "") else "?",
+            "power": item.get("power") if item.get("power") not in (None, "") else "?",
+            "families": item.get("families") or "暂无",
+            "description": item.get("description") or "暂无说明",
+            "flavor_text": item.get("flavor_text") or "",
+            "tags": tags,
+            "pets": pets,
+            "pet_total": (pets_data or {}).get("total") or len(pets),
+            "commandHint": "💡 /洛克wiki 技能 <技能名或ID>",
+            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+        }
+
+    def _extract_command_args_text(self, event: AstrMessageEvent, command_names: List[str]) -> str:
+        full_command = str(getattr(event, "message_str", "") or "").strip()
+        for command in command_names:
+            if command in full_command:
+                return full_command.split(command, 1)[1].strip()
+        return ""
+
+    def _wiki_catalog_by_token(self, token: str) -> Dict[str, Any] | None:
+        text = str(token or "").strip().lower()
+        return WIKI_CATALOG_ROUTES_BY_ALIAS.get(text)
+
+    def _split_wiki_command_parts(self, text: str) -> tuple[List[str], int]:
+        parts = str(text or "").strip().split()
+        page_no = 1
+        if parts:
+            tail = parts[-1]
+            page_match = re.fullmatch(r"(?:p|P|页|第)(\d+)(?:页)?|(\d+)页", tail)
+            if page_match and len(parts) > 1:
+                page_value = page_match.group(1) or page_match.group(2)
+                page_no = max(int(page_value), 1)
+                parts = parts[:-1]
+        return parts, page_no
+
+    def _wiki_catalog_usage_text(self) -> str:
+        catalogs = self._wiki_catalogs_from_payload(self._wiki_catalogs_cache or {})
+        names = "、".join((item.get("title") or item.get("key") or "") for item in catalogs[:24])
+        return (
+            "Wiki 用法：\n"
+            "  /洛克wiki <类型> [关键词或ID]\n"
+            "  /洛克wiki <关键词或ID>\n"
+            "示例：/洛克wiki 水灵、/洛克wiki 技能 圣光斩、/洛克wiki 物品 xx球、/洛克wiki 种植 食谱名\n"
+            f"后端目录：{names or '请稍后重试'}"
+        )
+
+    async def _get_wiki_catalogs_payload(self, force: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if not force and self._wiki_catalogs_cache is not None and now - self._wiki_catalogs_cache_ts < 300:
+            return self._wiki_catalogs_cache
+        payload = await self.client.get_wiki_catalogs()
+        if isinstance(payload, dict):
+            self._wiki_catalogs_cache = payload
+            self._wiki_catalogs_cache_ts = now
+            return payload
+        return self._wiki_catalogs_cache or {}
+
+    async def _get_wiki_options_payload(self, force: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if not force and self._wiki_options_cache is not None and now - self._wiki_options_cache_ts < 300:
+            return self._wiki_options_cache
+        payload = await self.client.get_wiki_options()
+        if isinstance(payload, dict):
+            self._wiki_options_cache = payload
+            self._wiki_options_cache_ts = now
+            return payload
+        return self._wiki_options_cache or {}
+
+    def _wiki_backend_catalog_items(self, payload: Any) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    def _wiki_backend_catalog_by_key(self, payload: Any) -> Dict[str, Dict[str, Any]]:
+        return {
+            str(item.get("key") or ""): item
+            for item in self._wiki_backend_catalog_items(payload)
+            if item.get("key")
+        }
+
+    def _wiki_catalog_from_backend_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(item.get("key") or "").strip()
+        base = WIKI_CATALOG_ROUTES_BY_KEY.get(key)
+        catalog = dict(base) if base else {
+            "key": key,
+            "title": str(item.get("name") or key or "Wiki"),
+            "aliases": [],
+            "list_path": "",
+            "detail_path": "",
+            "id_fields": [],
+            "search": None,
+        }
+        backend_name = str(item.get("name") or "").strip()
+        if backend_name and not base:
+            catalog["title"] = backend_name
+        aliases = list(catalog.get("aliases") or [])
+        for alias in (key, backend_name, backend_name.replace("图鉴", "").strip()):
+            if alias and alias not in aliases:
+                aliases.append(alias)
+        catalog["aliases"] = aliases
+        filters = item.get("filters") if isinstance(item.get("filters"), list) else []
+        has_q_filter = any(isinstance(f, dict) and f.get("key") == "q" for f in filters)
+        route_search = catalog.get("search")
+        catalog["search"] = has_q_filter if route_search is None else bool(route_search)
+        if item.get("path"):
+            catalog["list_path"] = str(item.get("path"))
+        catalog["_backend"] = item
+        return catalog
+
+    def _wiki_catalog_for_key_from_payload(self, key: str, catalogs_payload: Any) -> Dict[str, Any] | None:
+        item = self._wiki_backend_catalog_by_key(catalogs_payload).get(str(key or ""))
+        if item:
+            return self._wiki_catalog_from_backend_item(item)
+        route = WIKI_CATALOG_ROUTES_BY_KEY.get(str(key or ""))
+        return dict(route) if route else None
+
+    def _wiki_catalogs_from_payload(self, catalogs_payload: Any) -> List[Dict[str, Any]]:
+        return [self._wiki_catalog_from_backend_item(item) for item in self._wiki_backend_catalog_items(catalogs_payload)]
+
+    async def _get_wiki_catalog_by_key(self, key: str) -> Dict[str, Any] | None:
+        catalogs_payload = await self._get_wiki_catalogs_payload()
+        return self._wiki_catalog_for_key_from_payload(key, catalogs_payload)
+
+    def _wiki_dynamic_catalog_by_token(self, token: str, catalogs_payload: Any) -> Dict[str, Any] | None:
+        text = self._normalize_query_text(token)
+        if not text:
+            return None
+        for item in self._wiki_backend_catalog_items(catalogs_payload):
+            candidates = [
+                item.get("key"),
+                item.get("name"),
+                str(item.get("name") or "").replace("图鉴", "").strip(),
+            ]
+            if any(self._normalize_query_text(candidate) == text for candidate in candidates if candidate):
+                return self._wiki_catalog_from_backend_item(item)
+        return None
+
+    def _parse_wiki_command(self, event: AstrMessageEvent, fallback: str = "") -> tuple[Dict[str, Any] | None, str, int]:
+        text = self._extract_command_args_text(event, ["洛克wiki", "洛克百科"]) or str(fallback or "").strip()
+        if not text:
+            return None, "", 1
+        parts, page_no = self._split_wiki_command_parts(text)
+        catalog = self._wiki_catalog_by_token(parts[0]) if parts else None
+        if catalog:
+            return catalog, " ".join(parts[1:]).strip(), page_no
+        return None, text, page_no
+
+    def _wiki_global_search_catalogs(self, catalogs_payload: Any = None) -> List[Dict[str, Any]]:
+        catalogs = []
+        seen = set()
+        for catalog in self._wiki_catalogs_from_payload(catalogs_payload):
+            key = str(catalog.get("key") or "")
+            if key in seen or not catalog.get("list_path") or not catalog.get("search", True):
+                continue
+            catalogs.append(catalog)
+            seen.add(key)
+        return catalogs
+
+    def _wiki_global_catalog_priority(self, catalog: Dict[str, Any] | None) -> int:
+        key = str((catalog or {}).get("key") or "")
+        priorities = {
+            "pets": 0,
+            "skills": 0,
+            "balls": 1,
+            "pet-carryons": 1,
+            "medals": 1,
+            "plants": 1,
+            "pet-fruits": 1,
+            "recipes": 1,
+            "pet-eggs": 1,
+            "random-eggs": 1,
+            "egg-items": 1,
+            "skill-stones": 1,
+            "skill-stone-recipes": 1,
+            "pet-foods": 1,
+            "pet-gifts": 1,
+            "furniture": 1,
+            "fashion": 1,
+            "regions": 1,
+            "dungeons": 1,
+            "tasks": 1,
+            "task-summaries": 1,
+            "shops": 1,
+            "exchanges": 1,
+            "mails": 2,
+            "music": 2,
+            "chat-emojis": 2,
+            "photo-actions": 2,
+            "items": 3,
+            "profile-assets": 4,
+        }
+        return priorities.get(key, 2)
+
+    def _wiki_label_for_key(self, key: str) -> str:
+        labels = {
+            "pet_id": "精灵ID",
+            "skill_id": "技能ID",
+            "item_id": "物品ID",
+            "item_kind": "物品类型",
+            "egg_conf_id": "蛋配置ID",
+            "random_egg_id": "随机蛋ID",
+            "tree_id": "果实树ID",
+            "medal_id": "奖章ID",
+            "ball_id": "咕噜球ID",
+            "plant_id": "种植ID",
+            "carryon_id": "携带物ID",
+            "furniture_id": "家具ID",
+            "suit_id": "套装ID",
+            "region_id": "地区ID",
+            "dungeon_id": "副本ID",
+            "mail_id": "邮件ID",
+            "music_id": "音乐ID",
+            "asset_type": "资产类型",
+            "asset_id": "资产ID",
+            "emoji_id": "表情ID",
+            "action_type": "动作类型",
+            "action_id": "动作ID",
+            "task_id": "任务ID",
+            "summary_id": "剧情ID",
+            "shop_id": "商店ID",
+            "exchange_id": "兑换ID",
+            "handbook_no": "图鉴编号",
+            "stage": "阶段",
+            "quality": "品质",
+            "cost": "能量",
+            "power": "威力",
+            "level": "等级",
+            "total_exp": "累计经验",
+            "next_level_exp": "升级所需",
+            "next_level_total_exp": "下级累计",
+            "hatch_label": "孵化时间",
+            "hatch_seconds": "孵化秒数",
+            "egg_type": "蛋类型",
+            "egg_size": "蛋尺寸",
+            "body_size": "体型",
+            "type": "类型",
+            "skill_type": "技能类型",
+            "damage_type": "伤害类型",
+            "element_type": "属性",
+            "label_type": "标签",
+            "families": "技能族",
+            "pet_count": "可用精灵",
+            "learnable_pet_count": "可学习精灵",
+            "food_close_exp": "亲密经验",
+            "close_exp": "亲密经验",
+            "home_exp_num": "家园经验",
+            "furniture_coin_num": "家具币",
+            "need_time_label": "制作时间",
+            "interaction_count": "交互次数",
+            "comfort": "舒适度",
+            "footprint": "占地",
+            "gender": "性别",
+            "grade": "品级",
+            "bond": "羁绊",
+            "category": "分类",
+            "area": "区域",
+            "source": "来源",
+            "source_label": "来源",
+            "summary": "摘要",
+            "description": "说明",
+            "flavor_text": "背景说明",
+            "enabled": "启用",
+            "banned": "禁用",
+            "shareable": "可分享",
+            "common": "通用",
+            "nest_num": "巢穴数",
+            "egg_laying_nest_num": "产蛋巢数",
+            "pet_lay_egg_rate_percent": "产蛋概率",
+            "close_level": "亲密等级",
+            "action_label": "行为",
+        }
+        return labels.get(str(key or ""), str(key or "").replace("_", " "))
+
+    def _wiki_generic_value(self, value: Any, depth: int = 0) -> str:
+        if value in (None, ""):
+            return ""
+        if isinstance(value, bool):
+            return "是" if value else "否"
+        if isinstance(value, (int, float)):
+            return f"{value:g}" if isinstance(value, float) else str(value)
+        if isinstance(value, dict):
+            for key in ("name", "label", "title", "summary", "description", "text"):
+                text = str(value.get(key) or "").strip()
+                if text:
+                    return text
+            if "min_m" in value or "max_m" in value:
+                return self._wiki_range_label(value, "min_m", "max_m", "m")
+            if "min_kg" in value or "max_kg" in value:
+                return self._wiki_range_label(value, "min_kg", "max_kg", "kg")
+            if depth >= 1:
+                pairs = []
+                for key, item in list(value.items())[:4]:
+                    text = self._wiki_generic_value(item, depth + 1)
+                    if text:
+                        pairs.append(f"{self._wiki_label_for_key(key)}：{text}")
+                return "；".join(pairs)
+            return ""
+        if isinstance(value, list):
+            texts = [self._wiki_generic_value(item, depth + 1) for item in value[:6]]
+            texts = [item for item in texts if item]
+            suffix = " ..." if len(value) > 6 else ""
+            return "、".join(texts) + suffix
+        return str(value)
+
+    def _wiki_size_label(self, value: Any) -> str:
+        if not isinstance(value, dict):
+            return self._wiki_generic_value(value)
+        parts = []
+        height = value.get("height")
+        weight = value.get("weight")
+        if isinstance(height, dict):
+            text = self._wiki_range_label(height, "min_m", "max_m", "m")
+            if text and text != "暂无":
+                parts.append(f"高 {text}")
+        if isinstance(weight, dict):
+            text = self._wiki_range_label(weight, "min_kg", "max_kg", "kg")
+            if text and text != "暂无":
+                parts.append(f"重 {text}")
+        return " / ".join(parts)
+
+    def _wiki_footprint_label(self, value: Any) -> str:
+        if not isinstance(value, dict):
+            return self._wiki_generic_value(value)
+        width = value.get("width") or value.get("x") or value.get("cols")
+        height = value.get("height") or value.get("y") or value.get("rows")
+        if width not in (None, "") and height not in (None, ""):
+            return f"{width} x {height}"
+        return self._wiki_generic_value(value, 1)
+
+    def _wiki_count_label(self, value: Any, unit: str = "个") -> str:
+        if isinstance(value, list):
+            return f"{len(value)}{unit}"
+        if value in (None, ""):
+            return ""
+        return f"{value}{unit}" if isinstance(value, int) else str(value)
+
+    def _wiki_pick_image(self, item: Dict[str, Any]) -> str:
+        image_keys = [
+            "big_icon",
+            "image",
+            "cover_image",
+            "preview_image",
+            "checkout_icon",
+            "icon",
+            "small_icon",
+            "background_image",
+            "display_image",
+            "package_bg",
+            "package_cover",
+        ]
+        for key in image_keys:
+            value = item.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://", "{{")):
+                return value
+            if isinstance(value, dict):
+                url = value.get("url") or value.get("image") or value.get("icon")
+                if isinstance(url, str) and url.startswith(("http://", "https://", "{{")):
+                    return url
+        return ""
+
+    def _wiki_title_for_item(self, item: Dict[str, Any], fallback: str = "Wiki 条目") -> str:
+        for key in ("name", "title", "display_name", "summary", "description"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value[:48]
+        for key in (
+            "pet_id",
+            "skill_id",
+            "item_id",
+            "egg_conf_id",
+            "random_egg_id",
+            "tree_id",
+            "medal_id",
+            "ball_id",
+            "plant_id",
+            "furniture_id",
+            "suit_id",
+            "region_id",
+            "dungeon_id",
+            "mail_id",
+            "music_id",
+            "task_id",
+            "shop_id",
+            "exchange_id",
+            "id",
+        ):
+            if item.get(key) not in (None, ""):
+                return f"{fallback} #{item.get(key)}"
+        return fallback
+
+    def _wiki_summary_for_item(self, item: Dict[str, Any]) -> str:
+        for key in ("summary", "description", "desc", "effect", "flavor_text", "text", "content"):
+            value = self._wiki_generic_value(item.get(key))
+            if value:
+                return value[:180]
+        return ""
+
+    def _wiki_badges_for_item(self, item: Dict[str, Any]) -> List[str]:
+        badges = []
+        for key in ("type", "skill_type", "damage_type", "element_type", "category", "quality", "rarity", "label_type", "egg_type", "grade", "gender"):
+            value = self._wiki_generic_value(item.get(key))
+            if value:
+                badges.append(value)
+        for badge in item.get("badges") or []:
+            value = self._wiki_generic_value(badge)
+            if value:
+                badges.append(value)
+        for key in ("type_names", "egg_group_names", "tags", "source_counts"):
+            values = self._wiki_names(item.get(key))
+            badges.extend(values[:4])
+        output = []
+        seen = set()
+        for badge in badges:
+            key = str(badge)
+            if key and key not in seen:
+                output.append(key)
+                seen.add(key)
+        return output[:8]
+
+    def _wiki_add_fact(self, rows: List[Dict[str, str]], label: str, value: Any) -> None:
+        text = self._wiki_generic_value(value)
+        if text:
+            rows.append({"label": label, "value": text[:96]})
+
+    def _wiki_meta_for_item(self, item: Dict[str, Any], limit: int = 12, catalog_key: str = "") -> List[Dict[str, str]]:
+        rows = []
+        if catalog_key == "pets":
+            self._wiki_add_fact(rows, "图鉴编号", item.get("handbook_no"))
+            self._wiki_add_fact(rows, "精灵ID", item.get("pet_id"))
+            self._wiki_add_fact(rows, "属性", item.get("type_names") or item.get("types"))
+            self._wiki_add_fact(rows, "蛋组", item.get("egg_group_names") or item.get("egg_groups"))
+        elif catalog_key == "skills":
+            self._wiki_add_fact(rows, "技能ID", item.get("skill_id"))
+            self._wiki_add_fact(rows, "属性", item.get("element_type") or item.get("type"))
+            self._wiki_add_fact(rows, "类型", item.get("skill_type") or item.get("damage_type"))
+            self._wiki_add_fact(rows, "威力 / 能量", f"{item.get('power') or '-'} / {item.get('cost') or '-'}")
+            self._wiki_add_fact(rows, "可用精灵", item.get("pet_count"))
+        elif catalog_key in {"pet-eggs", "egg-items", "random-eggs", "pet-egg"}:
+            self._wiki_add_fact(rows, "蛋ID", item.get("egg_conf_id") or item.get("random_egg_id") or item.get("item_id"))
+            self._wiki_add_fact(rows, "蛋类型", item.get("egg_type"))
+            self._wiki_add_fact(rows, "孵化时间", item.get("hatch_label"))
+            self._wiki_add_fact(rows, "尺寸", self._wiki_size_label(item.get("egg_size")))
+            self._wiki_add_fact(rows, "关联精灵", item.get("pet"))
+        elif catalog_key in {"pet-foods", "pet-gifts"}:
+            self._wiki_add_fact(rows, "物品ID", item.get("item_id"))
+            self._wiki_add_fact(rows, "亲密经验", item.get("food_close_exp") or item.get("close_exp"))
+            self._wiki_add_fact(rows, "家园经验", item.get("home_exp_num"))
+            self._wiki_add_fact(rows, "制作时间", item.get("need_time_label"))
+            self._wiki_add_fact(rows, "交互次数", item.get("interaction_count"))
+        elif catalog_key == "home-egg-lay-rates":
+            self._wiki_add_fact(rows, "巢穴数", item.get("nest_num"))
+            self._wiki_add_fact(rows, "产蛋巢", item.get("egg_laying_nest_num"))
+            rate = item.get("pet_lay_egg_rate_percent")
+            self._wiki_add_fact(rows, "产蛋概率", f"{rate}%" if rate not in (None, "") else "")
+        elif catalog_key == "pet-levels":
+            self._wiki_add_fact(rows, "等级", item.get("level"))
+            self._wiki_add_fact(rows, "累计经验", item.get("total_exp"))
+            self._wiki_add_fact(rows, "下级所需", item.get("next_level_exp"))
+        elif catalog_key == "furniture":
+            self._wiki_add_fact(rows, "家具ID", item.get("furniture_id"))
+            self._wiki_add_fact(rows, "分类", item.get("category"))
+            self._wiki_add_fact(rows, "舒适度", item.get("comfort"))
+            self._wiki_add_fact(rows, "占地", self._wiki_footprint_label(item.get("footprint")))
+        elif catalog_key == "fashion":
+            self._wiki_add_fact(rows, "套装ID", item.get("suit_id"))
+            self._wiki_add_fact(rows, "性别", item.get("gender"))
+            self._wiki_add_fact(rows, "品级", item.get("grade"))
+            self._wiki_add_fact(rows, "部件", self._wiki_count_label(item.get("parts")))
+        elif catalog_key == "exchanges":
+            self._wiki_add_fact(rows, "兑换ID", item.get("exchange_id"))
+            self._wiki_add_fact(rows, "获得", item.get("get_items"))
+            self._wiki_add_fact(rows, "消耗", item.get("cost_items"))
+        elif catalog_key == "shops":
+            self._wiki_add_fact(rows, "商店ID", item.get("shop_id"))
+            self._wiki_add_fact(rows, "页签", item.get("tab_name"))
+            self._wiki_add_fact(rows, "商品数", self._wiki_count_label(item.get("goods")))
+        elif catalog_key in {"skill-stones", "skill-stone-recipes", "items", "pet-fruits", "recipes", "balls", "plants", "pet-carryons", "medals"}:
+            self._wiki_add_fact(rows, "物品ID", item.get("item_id") or item.get("medal_id") or item.get("ball_id") or item.get("plant_id") or item.get("carryon_id"))
+            self._wiki_add_fact(rows, "类型", item.get("type") or item.get("label_type"))
+            self._wiki_add_fact(rows, "品质", item.get("quality"))
+            self._wiki_add_fact(rows, "效果", item.get("summary") or item.get("catch_effect") or item.get("carryon"))
+        else:
+            for key in (
+                "pet_id", "skill_id", "item_id", "tree_id", "level", "close_level", "action_label",
+                "region_id", "dungeon_id", "mail_id", "music_id", "emoji_id", "task_id", "summary_id",
+                "asset_type", "asset_id", "action_type", "action_id", "quality", "type", "category",
+            ):
+                if key in item:
+                    self._wiki_add_fact(rows, self._wiki_label_for_key(key), item.get(key))
+        if rows:
+            return rows[:limit]
+        skip = {
+            "name",
+            "title",
+            "description",
+            "desc",
+            "summary",
+            "icon",
+            "small_icon",
+            "big_icon",
+            "image",
+            "cover_image",
+            "preview_image",
+            "background_image",
+            "items",
+            "rewards",
+            "reward_items",
+            "tags",
+            "badges",
+            "catalog",
+        }
+        for key, value in item.items():
+            if key in skip:
+                continue
+            text = self._wiki_generic_value(value)
+            if not text:
+                continue
+            rows.append({"label": self._wiki_label_for_key(key), "value": text[:80]})
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def _wiki_card_for_item(self, item: Dict[str, Any], fallback: str, catalog: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        catalog_key = str((catalog or {}).get("key") or "")
+        return {
+            "title": self._wiki_title_for_item(item, fallback),
+            "image": self._wiki_pick_image(item),
+            "summary": self._wiki_summary_for_item(item),
+            "badges": self._wiki_badges_for_item(item),
+            "meta": self._wiki_meta_for_item(item, 5, catalog_key),
+        }
+
+    def _wiki_result_command_examples(
+        self,
+        items: List[Dict[str, Any]],
+        catalog: Dict[str, Any] | None = None,
+        limit: int = 3,
+    ) -> List[str]:
+        examples = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            child = self._wiki_catalog_for_key_from_payload(
+                str(item.get("_catalog_key") or ""),
+                self._wiki_catalogs_cache or {},
+            ) or catalog or {}
+            category = str(item.get("_catalog_title") or child.get("title") or "").strip()
+            title = self._wiki_title_for_item(item, "").strip()
+            if not category or not title:
+                continue
+            command = f"/洛克wiki {category} {title}"
+            if command in seen:
+                continue
+            examples.append(command)
+            seen.add(command)
+            if len(examples) >= limit:
+                break
+        return examples
+
+    def _wiki_section_title(self, key: str) -> str:
+        labels = {
+            "items": "条目",
+            "members": "家族成员",
+            "probabilities": "概率信息",
+            "variants": "蛋型变体",
+            "voice_percent": "语音概率",
+            "topics": "图鉴课题",
+            "rewards": "奖励",
+            "reward_items": "奖励",
+            "acquire_methods": "获取方式",
+            "acquisition": "获取方式",
+            "methods": "获取方式",
+            "sources": "来源",
+            "world_maps": "世界地图",
+            "habitats": "栖息地",
+            "effects": "效果",
+            "rules": "规则",
+            "parts": "套装部件",
+            "tags": "标签",
+            "goods": "商品",
+            "mall_items": "商城商品",
+            "get_items": "获得物品",
+            "cost_items": "消耗物品",
+            "comfort_levels": "舒适度收益",
+            "levels": "等级成长",
+            "pet_bond_counts": "精灵羁绊",
+            "pet_home_limits": "入驻上限",
+            "settled_bonuses": "入驻加成",
+            "enjoy_field_types": "喜欢场景",
+            "hate_field_types": "讨厌场景",
+            "npc_reactions": "NPC 反应",
+            "movements": "骑乘动作",
+            "blood": "血脉技能",
+            "level": "升级习得",
+            "machine": "技能石习得",
+            "field": "场景习得",
+        }
+        return labels.get(str(key or ""), self._wiki_label_for_key(key))
+
+    def _wiki_rows_from_dict(self, value: Dict[str, Any], limit: int = 16) -> List[Dict[str, str]]:
+        rows = []
+        for key, item in value.items():
+            if key in {"icon", "small_icon", "big_icon", "image", "display_image"}:
+                continue
+            text = self._wiki_generic_value(item)
+            if text:
+                rows.append({"label": self._wiki_label_for_key(key), "value": text[:120]})
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def _wiki_sections_for_payload(self, payload: Any, catalog: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        sections = []
+        def add_list(title: str, value: Any) -> None:
+            if not isinstance(value, list) or not value:
+                return
+            dict_items = [item for item in value if isinstance(item, dict)]
+            if dict_items:
+                sections.append(
+                    {
+                        "title": title,
+                        "cards": [self._wiki_card_for_item(item, title, catalog) for item in dict_items[:12]],
+                        "rows": [],
+                        "total": len(dict_items),
+                    }
+                )
+                return
+            texts = [self._wiki_generic_value(item) for item in value[:16]]
+            texts = [text for text in texts if text]
+            if not texts:
+                return
+            sections.append(
+                {
+                    "title": title,
+                    "cards": [],
+                    "rows": [{"label": str(idx), "value": text} for idx, text in enumerate(texts, 1)],
+                    "total": len(texts),
+                }
+            )
+
+        for key, value in payload.items():
+            title = self._wiki_section_title(key)
+            if isinstance(value, dict) and key in {"probabilities", "npc_reactions", "catch_effect", "carryon", "planting", "limit", "bond", "mall_package"}:
+                rows = self._wiki_rows_from_dict(value)
+                if rows:
+                    sections.append({"title": title, "cards": [], "rows": rows, "total": len(rows)})
+                continue
+            add_list(title, value)
+            if isinstance(value, dict):
+                for subkey, subvalue in value.items():
+                    add_list(f"{title} / {self._wiki_section_title(subkey)}", subvalue)
+        return sections[:8]
+
+    def _wiki_merge_detail_payloads(self, base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(base or {})
+        for key, value in (extra or {}).items():
+            if value in (None, "", [], {}):
+                continue
+            old_value = merged.get(key)
+            if isinstance(old_value, dict) and isinstance(value, dict):
+                merged[key] = self._wiki_merge_detail_payloads(old_value, value)
+            elif isinstance(old_value, list) and isinstance(value, list):
+                seen = set()
+                combined = []
+                for item in [*old_value, *value]:
+                    marker = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str) if isinstance(item, (dict, list)) else str(item)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    combined.append(item)
+                merged[key] = combined
+            else:
+                merged[key] = value
+        return merged
+
+    def _wiki_item_detail_companion_keys(self, catalog: Dict[str, Any], detail: Dict[str, Any]) -> List[str]:
+        catalog_key = str((catalog or {}).get("key") or "")
+        item_id = detail.get("item_id")
+        if item_id in (None, ""):
+            return []
+        if catalog_key in {"skill-stones", "skill-stone-recipes", "balls", "medals", "pet-carryons"}:
+            return ["items"] if detail.get("item_kind") else []
+        if catalog_key != "items":
+            return []
+
+        flags = detail.get("flags") if isinstance(detail.get("flags"), dict) else {}
+        type_label = self._wiki_generic_value(detail.get("type") or detail.get("label_type"))
+        if flags.get("is_skill_stone") or type_label == "技能石":
+            return ["skill-stones"]
+        if flags.get("is_skill_stone_recipe") or str(detail.get("name") or "").startswith("配方-"):
+            return ["skill-stone-recipes"]
+        if type_label == "咕噜球":
+            return ["balls"]
+        if type_label in {"奖章", "勋章"}:
+            return ["medals"]
+        if type_label in {"携带物", "精灵携带物"}:
+            return ["pet-carryons"]
+        return []
+
+    async def _wiki_enrich_item_detail(self, catalog: Dict[str, Any], detail: Any) -> Any:
+        if not isinstance(detail, dict):
+            return detail
+        item_id = detail.get("item_id")
+        if item_id in (None, ""):
+            return detail
+
+        merged = dict(detail)
+        for key in self._wiki_item_detail_companion_keys(catalog, detail):
+            companion = self._wiki_catalog_for_key_from_payload(key, self._wiki_catalogs_cache or {})
+            if not companion:
+                continue
+            if key == "items":
+                item_kind = detail.get("item_kind")
+                if item_kind in (None, ""):
+                    continue
+                companion_detail = await self.client.get_wiki_path(f"/api/v1/games/rocom/wiki/items/{item_kind}/{item_id}")
+                if companion_detail:
+                    merged = self._wiki_merge_detail_payloads(companion_detail, merged)
+                continue
+            companion_detail = await self.client.get_wiki_path(f"/api/v1/games/rocom/wiki/{key}/{item_id}")
+            if companion_detail:
+                merged = self._wiki_merge_detail_payloads(merged, companion_detail)
+        return merged
+
+    def _wiki_path_params_from_item(self, catalog: Dict[str, Any], item: Dict[str, Any], raw_text: str = "") -> Dict[str, str]:
+        tokens = str(raw_text or "").split()
+        params: Dict[str, str] = {}
+        for idx, field in enumerate(catalog.get("id_fields") or []):
+            value = item.get(field)
+            if value in (None, "") and field == "item_id":
+                value = item.get("id")
+            if value in (None, "") and field == "asset_id":
+                value = item.get("id")
+            if value in (None, "") and field == "action_id":
+                value = item.get("id")
+            if value in (None, "") and field in {"ball_id", "plant_id", "carryon_id"}:
+                value = item.get("item_id") or item.get("id")
+            if value in (None, "") and idx < len(tokens):
+                value = tokens[idx]
+            if value not in (None, ""):
+                params[field] = str(value)
+        return params
+
+    def _wiki_fill_detail_path(self, catalog: Dict[str, Any], params: Dict[str, str]) -> str:
+        path = str(catalog.get("detail_path") or "")
+        for field in catalog.get("id_fields") or []:
+            value = params.get(field)
+            if value in (None, ""):
+                return ""
+            path = path.replace("{" + field + "}", str(value))
+        return path
+
+    def _wiki_item_matches_query_exact(self, catalog: Dict[str, Any], item: Dict[str, Any], query: str) -> bool:
+        query = str(query or "").strip()
+        if not query:
+            return False
+        normalized_query = self._normalize_query_text(query)
+        for field in catalog.get("id_fields") or []:
+            value = item.get(field)
+            if value in (None, "") and field in {"ball_id", "plant_id", "carryon_id"}:
+                value = item.get("item_id") or item.get("id")
+            if str(value or "") == query:
+                return True
+        title = self._wiki_title_for_item(item, "")
+        return self._normalize_query_text(title) == normalized_query
+
+    def _wiki_find_catalog_match(
+        self,
+        catalog: Dict[str, Any],
+        items: List[Dict[str, Any]],
+        query: str,
+        allow_single: bool = True,
+    ) -> Dict[str, Any] | None:
+        query = str(query or "").strip()
+        if not query:
+            return None
+        for item in items:
+            if self._wiki_item_matches_query_exact(catalog, item, query):
+                return item
+        if allow_single and len(items) == 1:
+            return items[0]
+        return None
+
+    def _wiki_similarity_score(self, query: str, item: Dict[str, Any]) -> float:
+        normalized_query = self._normalize_query_text(query)
+        if not normalized_query:
+            return 0.0
+        candidates = [
+            self._wiki_title_for_item(item, ""),
+            item.get("name") or "",
+            item.get("summary") or "",
+            item.get("description") or item.get("desc") or "",
+        ]
+        best = 0.0
+        for text in candidates:
+            normalized_text = self._normalize_query_text(text)
+            if not normalized_text:
+                continue
+            if normalized_query == normalized_text:
+                best = max(best, 1.0)
+            elif normalized_query in normalized_text or normalized_text in normalized_query:
+                best = max(best, 0.82)
+            else:
+                best = max(best, SequenceMatcher(None, normalized_query, normalized_text).ratio())
+        return best
+
+    async def _wiki_suggest_catalog_items(
+        self,
+        catalog: Dict[str, Any] | None,
+        query: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        if not catalog or not catalog.get("list_path"):
+            return []
+        query = str(query or "").strip()
+        if not query:
+            return []
+        terms = []
+        for term in (query, query[:2], query[:1], query[:-1]):
+            term = str(term or "").strip()
+            if term and term not in terms:
+                terms.append(term)
+
+        collected: Dict[str, Dict[str, Any]] = {}
+        for term in terms[:4]:
+            res = await self.client.list_wiki_catalog_items(
+                catalog["list_path"],
+                q=term,
+                page_no=1,
+                page_size=30,
+                search=bool(term and catalog.get("search", True)),
+            )
+            items = (res or {}).get("items") if isinstance(res, dict) else []
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                title = self._wiki_title_for_item(item, "")
+                key_parts = [catalog.get("key") or "", title]
+                for field in catalog.get("id_fields") or []:
+                    if item.get(field) not in (None, ""):
+                        key_parts.append(str(item.get(field)))
+                dedupe_key = "|".join(key_parts)
+                if dedupe_key not in collected:
+                    collected[dedupe_key] = item
+            if len(collected) >= limit * 3:
+                break
+
+        scored = []
+        for item in collected.values():
+            score = self._wiki_similarity_score(query, item)
+            if score >= 0.18:
+                scored.append((score, item))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        if not scored:
+            return list(collected.values())[:limit]
+        return [item for _, item in scored[:limit]]
+
+    def _build_generic_wiki_render_data(
+        self,
+        catalog: Dict[str, Any],
+        payload: Any,
+        query: str,
+        mode: str,
+        page_no: int = 1,
+    ) -> Dict[str, Any]:
+        payload = payload or {}
+        if mode == "global-search":
+            items = payload.get("items") if isinstance(payload, dict) else []
+            cards = []
+            for item in (items or []):
+                if not isinstance(item, dict):
+                    continue
+                child = self._wiki_catalog_for_key_from_payload(
+                    str(item.get("_catalog_key") or ""),
+                    self._wiki_catalogs_cache or {},
+                ) or catalog
+                card = self._wiki_card_for_item(item, child.get("title") or "Wiki", child)
+                if item.get("_catalog_title"):
+                    card["badges"] = [item["_catalog_title"], *card.get("badges", [])]
+                cards.append(card)
+            return {
+                "title": f"全局搜索：{query}",
+                "subtitle": "Wiki / 全局搜索",
+                "image": "",
+                "summary": "未指定分类时，会在所有可搜索的大分类接口中使用后端 q 参数查询。",
+                "badges": ["全局搜索", "可继续指定分类"],
+                "facts": [
+                    {"label": "查询词", "value": query or "-"},
+                    {"label": "结果数", "value": str(payload.get("total", len(cards)) if isinstance(payload, dict) else len(cards))},
+                    {"label": "搜索接口", "value": str(len(self._wiki_global_search_catalogs(self._wiki_catalogs_cache or {})))},
+                ],
+                "actionHint": "要查看具体条目，请按卡片绿色分类 tag 加名称继续查询。",
+                "actionExamples": self._wiki_result_command_examples(items or [], catalog),
+                "cards": cards,
+                "sections": [],
+                "commandHint": "💡 结果过多时可指定分类，例如 /洛克wiki 技能 水花 或 /洛克wiki 物品 国王球",
+                "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            }
+        if mode == "suggestions":
+            items = payload.get("items") if isinstance(payload, dict) else []
+            cards = []
+            for item in (items or []):
+                if not isinstance(item, dict):
+                    continue
+                child = self._wiki_catalog_for_key_from_payload(
+                    str(item.get("_catalog_key") or ""),
+                    self._wiki_catalogs_cache or {},
+                ) or catalog
+                card = self._wiki_card_for_item(item, child.get("title") or catalog["title"], child)
+                if item.get("_catalog_title"):
+                    card["badges"] = [item["_catalog_title"], *card.get("badges", [])]
+                cards.append(card)
+            return {
+                "title": f"没有找到「{query}」",
+                "subtitle": f"Wiki / {catalog['title']} / 联想结果",
+                "summary": "接口没有返回精确结果，下面是按名称、摘要和相似度整理的候选。",
+                "image": "",
+                "badges": [catalog["title"], "联想"],
+                "facts": [
+                    {"label": "查询词", "value": query or "-"},
+                    {"label": "候选数", "value": str(len(cards))},
+                ],
+                "actionHint": "接口没有精确命中时，可按候选卡片的绿色分类 tag 加名称继续查询。",
+                "actionExamples": self._wiki_result_command_examples(items or [], catalog),
+                "cards": cards,
+                "sections": [],
+                "commandHint": f"💡 可使用 /洛克wiki {catalog['title']} <候选名称或ID> 继续查询",
+                "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            }
+        if mode == "list":
+            items = payload.get("items") if isinstance(payload, dict) else []
+            cards = [self._wiki_card_for_item(item, catalog["title"], catalog) for item in (items or []) if isinstance(item, dict)]
+            catalog_info = payload.get("catalog") if isinstance(payload, dict) and isinstance(payload.get("catalog"), dict) else {}
+            title = f"{catalog['title']}列表"
+            summary = f"共 {payload.get('total', len(cards)) if isinstance(payload, dict) else len(cards)} 条"
+            return {
+                "title": title,
+                "subtitle": f"Wiki / {catalog['title']} / 第 {page_no} 页",
+                "image": "",
+                "summary": catalog_info.get("description") or summary,
+                "badges": [catalog["title"], "列表"],
+                "facts": [
+                    {"label": "当前页", "value": str(payload.get("page_no", page_no) if isinstance(payload, dict) else page_no)},
+                    {"label": "总页数", "value": str(payload.get("total_pages", "-") if isinstance(payload, dict) else "-")},
+                    {"label": "总数", "value": str(payload.get("total", len(cards)) if isinstance(payload, dict) else len(cards))},
+                ],
+                "actionHint": "搜索结果较多时，可按分类加名称继续查询具体条目。" if query else "",
+                "actionExamples": self._wiki_result_command_examples(items or [], catalog) if query else [],
+                "cards": cards,
+                "sections": [],
+                "commandHint": "💡 /洛克wiki <类型> <关键词或ID> | /洛克wiki 查看支持类型",
+                "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+            }
+        item = payload if isinstance(payload, dict) else {}
+        facts = self._wiki_meta_for_item(item, 16, str(catalog.get("key") or ""))
+        return {
+            "title": self._wiki_title_for_item(item, catalog["title"]),
+            "subtitle": f"Wiki / {catalog['title']}",
+            "image": self._wiki_pick_image(item),
+            "summary": self._wiki_summary_for_item(item),
+            "badges": [catalog["title"], *self._wiki_badges_for_item(item)],
+            "facts": facts,
+            "cards": [],
+            "sections": self._wiki_sections_for_payload(item, catalog),
+            "commandHint": "💡 /洛克wiki <类型> <关键词或ID> | /洛克wiki 查看支持类型",
+            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+        }
+
+    def _build_wiki_catalog_render_data(self, catalogs_payload: Any = None, options_payload: Any = None) -> Dict[str, Any]:
+        catalogs = self._wiki_catalogs_from_payload(catalogs_payload)
+        options_groups = len(options_payload) if isinstance(options_payload, dict) else 0
+
+        def topic_card(catalog: Dict[str, Any]) -> Dict[str, Any]:
+            backend = catalog.get("_backend") if isinstance(catalog.get("_backend"), dict) else {}
+            filters = backend.get("filters") if isinstance(backend.get("filters"), list) else []
+            filter_text = "、".join(
+                str(item.get("label") or item.get("key") or "")
+                for item in filters[:6]
+                if isinstance(item, dict)
+            )
+            title = str(catalog.get("title") or backend.get("name") or catalog.get("key") or "Wiki")
+            key = str(catalog.get("key") or "")
+            count = backend.get("count")
+            hint = f"/洛克wiki {title} <关键词或ID>"
+            if key:
+                hint = f"{hint} / /洛克wiki {key} <关键词或ID>"
+            coverage = str(backend.get("description") or "").strip()
+            if filter_text:
+                coverage = f"{coverage} 筛选：{filter_text}".strip()
+            return {
+                "title": title,
+                "key": key,
+                "summary": f"{hint} · 条目 {count}" if count not in (None, "") else hint,
+                "desc": key,
+                "children": coverage,
+            }
+
+        groups = [
+            {
+                "title": "后端 Wiki 图鉴入口",
+                "desc": "以下入口来自 /wiki/catalogs；筛选项来自 /wiki/options 和各入口 filters。",
+                "items": [topic_card(item) for item in catalogs],
+                "total": len(catalogs),
+            }
+        ]
+        return {
+            "title": "洛克 Wiki",
+            "subtitle": "统一资料查询入口",
+            "summary": "可直接全局搜索，也可指定后端返回的图鉴入口缩小范围；目录和筛选项会从后端接口实时读取。",
+            "badges": ["Wiki", "全局搜索", "接口实时"],
+            "facts": [
+                {"label": "后端目录", "value": str(len(catalogs)) if catalogs else "-"},
+                {"label": "筛选模块", "value": str(options_groups) if options_groups else "-"},
+                {"label": "搜索方式", "value": "全局搜索 / 指定入口"},
+            ],
+            "primary": [],
+            "groups": groups,
+            "commandHint": "💡 示例：/洛克wiki 水灵 | /洛克wiki 技能 圣光斩 | /洛克wiki 物品 国王球",
+            "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
+        }
+
+    async def _fetch_generic_wiki_catalog(
+        self,
+        catalog: Dict[str, Any],
+        query: str,
+        page_no: int,
+    ) -> tuple[Any, str, str]:
+        query = str(query or "").strip()
+        detail_path = str(catalog.get("detail_path") or "")
+        list_path = str(catalog.get("list_path") or "")
+
+        if detail_path and query:
+            direct_params = self._wiki_path_params_from_item(catalog, {}, query)
+            if catalog.get("id_fields") == ["pet_id"] and not str(query).isdigit():
+                pet, _, _ = await self._resolve_wiki_pet(query)
+                if pet and pet.get("pet_id") not in (None, ""):
+                    direct_params["pet_id"] = str(pet.get("pet_id"))
+            if catalog.get("id_fields") == ["skill_id"] and not str(query).isdigit():
+                skill, _, _ = await self._resolve_wiki_skill(query)
+                if skill and skill.get("skill_id") not in (None, ""):
+                    direct_params["skill_id"] = str(skill.get("skill_id"))
+            direct_path = self._wiki_fill_detail_path(catalog, direct_params)
+            type_fields = {"item_kind", "asset_type", "action_type"}
+            id_fields = catalog.get("id_fields") or []
+            direct_allowed = bool(direct_path) and len(direct_params) >= len(id_fields)
+            for field in id_fields:
+                if field in type_fields:
+                    continue
+                if not str(direct_params.get(field) or "").isdigit():
+                    direct_allowed = False
+                    break
+            if direct_allowed:
+                detail = await self.client.get_wiki_path(direct_path)
+                if detail:
+                    return await self._wiki_enrich_item_detail(catalog, detail), "detail", ""
+
+        if not list_path:
+            return None, "detail", f"{catalog['title']} 需要提供 ID。用法：/洛克wiki {catalog['title']} <ID>"
+
+        list_res = await self.client.list_wiki_catalog_items(
+            list_path,
+            q=query,
+            page_no=page_no,
+            page_size=12,
+            search=bool(catalog.get("search", True)),
+        )
+        if list_res is None:
+            return None, "list", f"获取 {catalog['title']} 失败：{self.client.get_last_error()}"
+        if not isinstance(list_res, dict) or "items" not in list_res:
+            return list_res, "detail", ""
+
+        items = (list_res or {}).get("items") or []
+        if query and not items:
+            suggestions = await self._wiki_suggest_catalog_items(catalog, query, 10)
+            if suggestions:
+                return {"items": suggestions, "query": query}, "suggestions", ""
+        if detail_path and query and items:
+            selected = self._wiki_find_catalog_match(catalog, items, query)
+            if selected:
+                params = self._wiki_path_params_from_item(catalog, selected, query)
+                selected_path = self._wiki_fill_detail_path(catalog, params)
+                if selected_path:
+                    detail = await self.client.get_wiki_path(selected_path)
+                    if detail:
+                        return await self._wiki_enrich_item_detail(catalog, detail), "detail", ""
+        return list_res, "list", ""
+
+    async def _fetch_wiki_detail_for_catalog_item(
+        self,
+        catalog: Dict[str, Any],
+        item: Dict[str, Any],
+        query: str,
+    ) -> Dict[str, Any] | None:
+        if not catalog.get("detail_path"):
+            return None
+        params = self._wiki_path_params_from_item(catalog, item, query)
+        detail_path = self._wiki_fill_detail_path(catalog, params)
+        if not detail_path:
+            return None
+        detail = await self.client.get_wiki_path(detail_path)
+        return await self._wiki_enrich_item_detail(catalog, detail)
+
+    async def _fetch_global_wiki_search(self, query: str, page_no: int) -> tuple[Any, str, str]:
+        query = str(query or "").strip()
+        if not query:
+            return None, "global-search", "请输入 Wiki 关键词。"
+
+        catalogs_payload = await self._get_wiki_catalogs_payload()
+        catalogs = self._wiki_global_search_catalogs(catalogs_payload)
+        if not catalogs:
+            return None, "global-search", "暂无可全局搜索的 Wiki 接口。"
+
+        semaphore = asyncio.Semaphore(8)
+
+        async def fetch_catalog(catalog: Dict[str, Any]) -> tuple[Dict[str, Any], List[Dict[str, Any]], str]:
+            async with semaphore:
+                res = await self.client.list_wiki_catalog_items(
+                    catalog["list_path"],
+                    q=query,
+                    page_no=page_no,
+                    page_size=6,
+                    search=True,
+                )
+            if res is None:
+                return catalog, [], self.client.get_last_error("")
+            items = (res or {}).get("items") if isinstance(res, dict) else []
+            return catalog, [item for item in (items or []) if isinstance(item, dict)], ""
+
+        results = await asyncio.gather(*(fetch_catalog(catalog) for catalog in catalogs), return_exceptions=True)
+        collected: Dict[str, Dict[str, Any]] = {}
+        exact_keys = set()
+        errors = []
+
+        for result in results:
+            if isinstance(result, Exception):
+                errors.append(str(result))
+                continue
+            catalog, items, error = result
+            if error:
+                errors.append(f"{catalog.get('title') or catalog.get('key')}：{error}")
+                continue
+            for item in items:
+                merged = dict(item)
+                merged["_catalog_key"] = catalog.get("key")
+                merged["_catalog_title"] = catalog.get("title")
+                title = self._wiki_title_for_item(item, "")
+                key_parts = [str(catalog.get("key") or ""), title]
+                for field in catalog.get("id_fields") or []:
+                    value = item.get(field)
+                    if value in (None, "") and field in {"ball_id", "plant_id", "carryon_id"}:
+                        value = item.get("item_id") or item.get("id")
+                    if value not in (None, ""):
+                        key_parts.append(str(value))
+                dedupe_key = "|".join(key_parts)
+                if dedupe_key in collected:
+                    continue
+                score = self._wiki_similarity_score(query, merged)
+                if self._wiki_item_matches_query_exact(catalog, item, query):
+                    score += 10 - (self._wiki_global_catalog_priority(catalog) * 0.01)
+                    exact_keys.add(dedupe_key)
+                merged["_match_score"] = score
+                collected[dedupe_key] = merged
+
+        items = list(collected.values())
+        items.sort(key=lambda item: item.get("_match_score", 0), reverse=True)
+
+        exact_items = [collected[key] for key in exact_keys if key in collected]
+        if exact_items:
+            exact_items.sort(
+                key=lambda item: (
+                    self._wiki_global_catalog_priority(self._wiki_catalog_for_key_from_payload(str(item.get("_catalog_key") or ""), catalogs_payload)),
+                    -float(item.get("_match_score", 0)),
+                )
+            )
+            best_priority = self._wiki_global_catalog_priority(
+                self._wiki_catalog_for_key_from_payload(str(exact_items[0].get("_catalog_key") or ""), catalogs_payload)
+            )
+            best_items = [
+                item
+                for item in exact_items
+                if self._wiki_global_catalog_priority(self._wiki_catalog_for_key_from_payload(str(item.get("_catalog_key") or ""), catalogs_payload)) == best_priority
+            ]
+            if len(best_items) == 1:
+                exact_item = best_items[0]
+                catalog = self._wiki_catalog_for_key_from_payload(str(exact_item.get("_catalog_key") or ""), catalogs_payload)
+                if catalog:
+                    detail = await self._fetch_wiki_detail_for_catalog_item(catalog, exact_item, query)
+                    if detail:
+                        return {"item": detail, "_catalog": catalog}, "global-detail", ""
+
+        if items:
+            return {
+                "items": items[:12],
+                "query": query,
+                "total": len(items),
+                "_global": True,
+            }, "global-search", ""
+
+        if errors:
+            return None, "global-search", f"全局搜索失败：{errors[0]}"
+        return {"items": [], "query": query, "total": 0, "_global": True}, "global-search", ""
+
+    def _atlas_index_path(self) -> str:
+        return os.path.join(self.atlas_dir, "path.json")
+
+    def _atlas_pets_dir(self) -> str:
+        return os.path.join(self.atlas_dir, "pets")
+
+    def _atlas_pet_alias_path(self) -> str:
+        return os.path.join(self.atlas_dir, "othername", "pets.yaml")
+
+    def _atlas_ready(self) -> bool:
+        return os.path.isfile(self._atlas_index_path()) and os.path.isdir(self._atlas_pets_dir())
+
+    def _load_atlas_index(self) -> Dict[str, str]:
+        try:
+            with open(self._atlas_index_path(), "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            logger.warning(f"[Rocom Atlas] 读取本地图鉴索引失败: {e}")
+            return {}
+        pets = payload.get("pets") if isinstance(payload, dict) else {}
+        return pets if isinstance(pets, dict) else {}
+
+    def _strip_atlas_yaml_value(self, value: str) -> str:
+        text = str(value or "").strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+            return text[1:-1].strip()
+        return text
+
+    def _load_atlas_pet_aliases(self) -> Dict[str, List[str]]:
+        path = self._atlas_pet_alias_path()
+        if not os.path.isfile(path):
+            return {}
+        aliases: Dict[str, List[str]] = {}
+        current_name = ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.rstrip("\r\n")
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if not line[:1].isspace() and stripped.endswith(":"):
+                        current_name = self._strip_atlas_yaml_value(stripped[:-1])
+                        if current_name:
+                            key = self._normalize_query_text(current_name)
+                            aliases.setdefault(key, [])
+                            if current_name not in aliases[key]:
+                                aliases[key].append(current_name)
+                        continue
+                    if current_name and stripped.startswith("-"):
+                        alias = self._strip_atlas_yaml_value(stripped[1:])
+                        if not alias:
+                            continue
+                        key = self._normalize_query_text(alias)
+                        aliases.setdefault(key, [])
+                        if current_name not in aliases[key]:
+                            aliases[key].append(current_name)
+        except Exception as e:
+            logger.warning(f"[Rocom Atlas] 读取本地图鉴别名失败: {e}")
+            return {}
+        return aliases
+
+    def _atlas_local_image_path(self, atlas_rel_path: str) -> str:
+        rel = str(atlas_rel_path or "").replace("\\", "/").lstrip("/")
+        if not rel:
+            return ""
+        candidate = os.path.abspath(os.path.join(self.atlas_dir, *rel.split("/")))
+        root = os.path.abspath(self.atlas_dir)
+        try:
+            if os.path.commonpath([root, candidate]) != root:
+                return ""
+        except ValueError:
+            return ""
+        return candidate
+
+    def _atlas_existing_image_path(self, index: Dict[str, str], name: str) -> str:
+        path = self._atlas_local_image_path(index.get(name, ""))
+        return path if path and os.path.isfile(path) else ""
+
+    def _find_atlas_match(self, query: str) -> tuple[str, str, List[str]]:
+        query = str(query or "").strip()
+        if not query:
+            return "", "", []
+        if query.isdigit():
+            path = os.path.join(self._atlas_pets_dir(), f"{query}.png")
+            if os.path.isfile(path):
+                return f"#{query}", path, []
+
+        index = self._load_atlas_index()
+        if not index:
+            return "", "", []
+
+        normalized_query = self._normalize_query_text(query)
+        exact_key = ""
+        for name in index.keys():
+            if self._normalize_query_text(name) == normalized_query:
+                exact_key = name
+                break
+        if exact_key:
+            path = self._atlas_existing_image_path(index, exact_key)
+            if path:
+                return exact_key, path, []
+
+        alias_map = self._load_atlas_pet_aliases()
+        exact_alias_candidates = [
+            name
+            for name in alias_map.get(normalized_query, [])
+            if self._atlas_existing_image_path(index, name)
+        ]
+        if exact_alias_candidates:
+            only = exact_alias_candidates[0]
+            return only, self._atlas_existing_image_path(index, only), []
+
+        candidates = []
+
+        def add_candidate(name: str):
+            if name not in candidates and self._atlas_existing_image_path(index, name):
+                candidates.append(name)
+
+        for name, rel_path in index.items():
+            normalized_name = self._normalize_query_text(name)
+            if normalized_query and (normalized_query in normalized_name or normalized_name in normalized_query):
+                add_candidate(name)
+        for alias, names in alias_map.items():
+            if normalized_query and (normalized_query in alias or alias in normalized_query):
+                for name in names:
+                    add_candidate(name)
+        if len(candidates) == 1:
+            only = candidates[0]
+            return only, self._atlas_existing_image_path(index, only), []
+        return "", "", candidates[:10]
+
+    def _safe_replace_atlas_dir(self, prepared_dir: str) -> None:
+        target = os.path.abspath(self.atlas_dir)
+        data_root = os.path.abspath(self.data_dir)
+        if os.path.commonpath([data_root, target]) != data_root:
+            raise RuntimeError("图鉴目标目录不在插件数据目录内")
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        shutil.move(prepared_dir, target)
+
+    def _prepare_atlas_dir(self, source_root: str, prepared_dir: str) -> tuple[int, int]:
+        os.makedirs(prepared_dir, exist_ok=True)
+        for name in ("path.json", "index", "othername", "pets"):
+            src = os.path.join(source_root, name)
+            dst = os.path.join(prepared_dir, name)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst)
+            elif os.path.isfile(src):
+                shutil.copy2(src, dst)
+        if not os.path.isfile(os.path.join(prepared_dir, "path.json")):
+            raise RuntimeError("Atlas 缺少 path.json")
+        if not os.path.isfile(os.path.join(prepared_dir, "othername", "pets.yaml")):
+            raise RuntimeError("Atlas 缺少 othername/pets.yaml")
+        pets_dir = os.path.join(prepared_dir, "pets")
+        if not os.path.isdir(pets_dir):
+            raise RuntimeError("Atlas 缺少 pets 图片目录")
+        image_count = len([name for name in os.listdir(pets_dir) if name.lower().endswith(".png")])
+        total_bytes = sum(
+            os.path.getsize(os.path.join(root, name))
+            for root, _, files in os.walk(prepared_dir)
+            for name in files
+        )
+        return image_count, total_bytes
+
+    async def _emit_atlas_progress(
+        self,
+        progress_cb: Callable[[int, str], Awaitable[None]] | None,
+        percent: int,
+        stage: str,
+    ) -> None:
+        if progress_cb:
+            await progress_cb(max(0, min(100, int(percent))), stage)
+
+    async def _download_atlas_zip(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        zip_path: str,
+        progress_cb: Callable[[int, str], Awaitable[None]] | None = None,
+    ) -> None:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length") or 0)
+            downloaded = 0
+            with open(zip_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            await self._emit_atlas_progress(
+                                progress_cb,
+                                int(downloaded * 80 / total),
+                                "正在下载图鉴压缩包",
+                            )
+                        elif downloaded == len(chunk):
+                            await self._emit_atlas_progress(progress_cb, 20, "正在下载图鉴压缩包")
+            await self._emit_atlas_progress(progress_cb, 80, "图鉴压缩包下载完成")
+
+    async def _clone_atlas_repo(
+        self,
+        dst: str,
+        progress_cb: Callable[[int, str], Awaitable[None]] | None = None,
+    ) -> None:
+        if not shutil.which("git"):
+            raise RuntimeError("GitHub 压缩包不可用，且当前环境未安装 git，无法使用 git clone 兜底")
+        await self._emit_atlas_progress(progress_cb, 20, "正在连接图鉴仓库")
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--progress",
+            "https://github.com/Entropy-Increase-Team/Rocom-Atlas.git",
+            dst,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        output_parts: List[str] = []
+
+        async def consume_stream(stream: asyncio.StreamReader | None):
+            if not stream:
+                return
+            while True:
+                chunk = await stream.read(1024)
+                if not chunk:
+                    break
+                text = chunk.decode("utf-8", errors="ignore")
+                output_parts.append(text)
+                for matched in re.findall(r"(\d{1,3})%", text):
+                    raw_percent = max(0, min(100, int(matched)))
+                    await self._emit_atlas_progress(
+                        progress_cb,
+                        int(raw_percent * 80 / 100),
+                        "正在 git clone 图鉴仓库",
+                    )
+
+        consumers = [
+            asyncio.create_task(consume_stream(proc.stdout)),
+            asyncio.create_task(consume_stream(proc.stderr)),
+        ]
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=180)
+            await asyncio.gather(*consumers)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            for task in consumers:
+                task.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+            raise RuntimeError("git clone Rocom-Atlas 超时")
+        if proc.returncode != 0:
+            message = "".join(output_parts).strip()
+            raise RuntimeError(f"git clone Rocom-Atlas 失败：{message or proc.returncode}")
+        await self._emit_atlas_progress(progress_cb, 80, "图鉴仓库下载完成")
+
+    async def _download_atlas_archive(
+        self,
+        progress_cb: Callable[[int, str], Awaitable[None]] | None = None,
+    ) -> tuple[int, int]:
+        urls = [
+            "https://codeload.github.com/Entropy-Increase-Team/Rocom-Atlas/zip/refs/heads/main",
+            "https://github.com/Entropy-Increase-Team/Rocom-Atlas/archive/refs/heads/main.zip",
+        ]
+        tmp_root = tempfile.mkdtemp(prefix="rocom_atlas_")
+        zip_path = os.path.join(tmp_root, "atlas.zip")
+        extract_dir = os.path.join(tmp_root, "extract")
+        prepared_dir = os.path.join(tmp_root, "rocom_atlas")
+        clone_dir = os.path.join(tmp_root, "clone")
+        try:
+            timeout = httpx.Timeout(connect=20.0, read=180.0, write=30.0, pool=20.0)
+            zip_errors = []
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                for url in urls:
+                    try:
+                        await self._download_atlas_zip(client, url, zip_path, progress_cb)
+                        break
+                    except Exception as e:
+                        zip_errors.append(f"{url}: {e}")
+                        if os.path.exists(zip_path):
+                            os.remove(zip_path)
+
+            if os.path.isfile(zip_path):
+                await self._emit_atlas_progress(progress_cb, 80, "正在解压图鉴文件")
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(extract_dir)
+                roots = [
+                    os.path.join(extract_dir, name)
+                    for name in os.listdir(extract_dir)
+                    if os.path.isdir(os.path.join(extract_dir, name))
+                ]
+                if not roots:
+                    raise RuntimeError("Atlas 压缩包结构异常")
+                image_count, total_bytes = self._prepare_atlas_dir(roots[0], prepared_dir)
+            else:
+                logger.warning(f"[Rocom Atlas] GitHub zip 下载失败，尝试 git clone：{' | '.join(zip_errors)}")
+                await self._clone_atlas_repo(clone_dir, progress_cb)
+                await self._emit_atlas_progress(progress_cb, 80, "正在整理图鉴文件")
+                image_count, total_bytes = self._prepare_atlas_dir(clone_dir, prepared_dir)
+            self._safe_replace_atlas_dir(prepared_dir)
+            await self._emit_atlas_progress(progress_cb, 100, "本地图鉴缓存已更新")
+            prepared_dir = ""
+            return image_count, total_bytes
+        finally:
+            if prepared_dir and os.path.exists(prepared_dir):
+                shutil.rmtree(prepared_dir, ignore_errors=True)
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
     def _normalize_lineup_lookup_id(self, raw_value: str) -> str:
         text = str(raw_value or "").strip()
@@ -2142,7 +4968,7 @@ class RocomPlugin(Star):
             "signature": signature,
             "showSignature": bool(signature),
             "sections": curated_sections,
-            "commandHint": "💡 /洛克玩家 <UID>",
+            "commandHint": "💡 /洛克玩家 [UID]",
             "copyright": "AstrBot & WeGame Locke Kingdom Plugin",
         }
 
@@ -2296,7 +5122,7 @@ class RocomPlugin(Star):
                 },
                 {
                     "groupTitle": "数据查询",
-                    "groupSubtitle": "查询推送服务（含实验性/暂不可用功能）",
+                    "groupSubtitle": "查询推送服务（含实验性功能）",
                     "menuItems": [
                         {"cmd": "洛克档案", "desc": "生成个人数据名片"},
                         {"cmd": "洛克战绩 <页码>", "desc": "查询并展示近期的对战场次记录"},
@@ -2304,19 +5130,28 @@ class RocomPlugin(Star):
                         {"cmd": "洛克阵容 <分类> <页码>", "desc": "查看阵容助手推荐阵容 (参数可交换)"},
                         {"cmd": "洛克交换大厅 <页码>", "desc": "查看交换大厅海报 (支持别名：洛克大厅/交换大厅)"},
                         {"cmd": "远行商人", "desc": "查看当前轮次远行商人商品"},
+                        {"cmd": "洛克公告 [页码]", "desc": "查询洛克王国公告列表"},
+                        {"cmd": "洛克公告详情 <公告ID>", "desc": "查看指定公告详情"},
+                        {"cmd": "洛克公告最新", "desc": "查看最新一条公告"},
+                        {"cmd": "洛克活动日历", "desc": "查询 activities/info 活动日历"},
+                        {"cmd": "订阅洛克公告", "desc": "订阅新公告推送（群聊需群主/群管/bot管理员）"},
+                        {"cmd": "取消订阅洛克公告", "desc": "关闭当前会话的新公告推送"},
                         {"cmd": "洛克商店 <shop_id>", "desc": "实验性：查询商店信息，接口返回暂不稳定"},
-                        {"cmd": "洛克玩家 <UID>", "desc": "通过 ingame 接口查询玩家基础信息，当前推荐优先使用"},
+                        {"cmd": "洛克玩家 [UID]", "desc": "通过 ingame 队列接口查询玩家基础信息"},
                         {"cmd": "洛克家园 [UID]", "desc": "通过 UID 查询自己或他人的家园菜园、守卫和室内精灵"},
+                        {"cmd": "家园详情 [UID] [pet_gid] [npc_id]", "desc": "查询目标家园摆放精灵完整数据，目标玩家需在线"},
                         {"cmd": "订阅家园菜园 [UID]", "desc": "订阅指定 UID 的菜园提醒：首个成熟/全部成熟"},
                         {"cmd": "订阅家园灵感 [UID]", "desc": "订阅指定 UID 的灵感提醒：首个完成/全部完成"},
-                        {"cmd": "取消订阅家园 [菜园/灵感/全部] [UID]", "desc": "取消当前会话的家园订阅"},
+                        {"cmd": "订阅家园生蛋 [UID]", "desc": "订阅指定 UID 的生蛋提醒：首个可领取/全部可领取"},
+                        {"cmd": "取消订阅家园 [菜园/灵感/生蛋/全部] [UID]", "desc": "取消当前会话的家园订阅"},
                         {"cmd": "订阅远行商人 1/0 [商品 商品]", "desc": "群主/群管/bot管理可配置本群订阅商品，不填商品则用默认配置"},
                         {"cmd": "取消订阅远行商人", "desc": "关闭当前群远行商人订阅"},
                         {"cmd": "洛克好友关系 <id1,id2>", "desc": "实验性：仅返回有限状态字段，关系说明暂不稳定（需登录）"},
                         {"cmd": "洛克学生", "desc": "实验性：接口信息量有限，当前仅供测试查看（需登录）"},
-                        {"cmd": "洛克wiki <精灵名>", "desc": "暂不可用：接口暂时关闭，当前仅返回提示"},
-                        {"cmd": "洛克技能 <技能名>", "desc": "暂不可用：接口暂时关闭，当前仅返回提示"},
-                        {"cmd": "洛克查蛋 <精灵名>", "desc": "查询精灵蛋组及可配种精灵 (支持别名：查蛋)"},
+                        {"cmd": "图鉴下载", "desc": "下载 Rocom-Atlas 本地图鉴图片，图库仍在构建中可能缺图"},
+                        {"cmd": "精灵图鉴 <精灵名>", "desc": "仅查询本地 Rocom-Atlas 图片集"},
+                        {"cmd": "洛克wiki [类型] [关键词/ID]", "desc": "统一 Wiki 查询入口；无参数显示支持的专题类型"},
+                        {"cmd": "洛克查蛋 <精灵名>", "desc": "后端图鉴优先查询蛋组及可配种精灵，后端不可用时本地兜底 (别名：查蛋)"},
                         {"cmd": "洛克查蛋 0.18m 1.5kg", "desc": "按身高和体重反查精灵，身高统一使用游戏原生 m"},
                         {"cmd": "洛克配种 <精灵A> <精灵B>", "desc": "判断两只精灵能否配种 (支持别名：配种)"}
                     ]
@@ -2773,7 +5608,15 @@ class RocomPlugin(Star):
             logger.warning("[Rocom] 洛克档案：collection 接口不可用，已降级为基础档案渲染")
         if not bo:
             logger.warning("[Rocom] 洛克档案：battle-overview 接口不可用，已降级为基础档案渲染")
-        player_search_res = await self.client.ingame_player_search(role.get("id", "")) if role.get("id") else None
+        player_search_res = (
+            await self.client.ingame_player_search(
+                role.get("id", ""),
+                fw_token=fw_token,
+                user_identifier=user_identifier,
+            )
+            if role.get("id")
+            else None
+        )
         player_search_data = (
             self._parse_ingame_player_payload(player_search_res, str(role.get("id", "")))
             if player_search_res
@@ -3122,23 +5965,352 @@ class RocomPlugin(Star):
             yield event.image_result(img_url)
         else:
             yield event.plain_result("背包图生成失败。")
-    @filter.command("洛克wiki")
-    async def rocom_wiki(self, event: AstrMessageEvent, name: str = "焰火"):
-        """查询精灵 wiki"""
+    @filter.command("图鉴下载")
+    async def rocom_atlas_download(self, event: AstrMessageEvent):
+        """下载 Rocom-Atlas 本地图鉴图片"""
+        try:
+            sent_thresholds = set()
+
+            async def notify_progress(percent: int, stage: str):
+                for threshold in (20, 40, 60, 80, 100):
+                    if percent >= threshold and threshold not in sent_thresholds:
+                        sent_thresholds.add(threshold)
+                        await event.send(event.plain_result(f"图鉴下载进度：{threshold}%（{stage}）"))
+
+            image_count, total_bytes = await self._download_atlas_archive(notify_progress)
+            size_mb = total_bytes / 1024 / 1024
+            yield event.plain_result(
+                f"图鉴下载完成：已缓存 {image_count} 张图片，约 {size_mb:.1f} MB。\n"
+                f"本地目录：{self.atlas_dir}\n"
+                f"现在可以使用 /精灵图鉴 <精灵名> 查询。\n"
+                f"提示：Rocom-Atlas 图库仍在构建中；若仓库为私有仓库，请确保当前环境具备访问权限。"
+            )
+        except httpx.HTTPError as e:
+            yield event.plain_result(f"图鉴下载失败：网络请求异常 {e}\n请稍后重试 /图鉴下载。")
+        except Exception as e:
+            logger.error(f"[Rocom Atlas] 图鉴下载失败: {e}")
+            yield event.plain_result(f"图鉴下载失败：{e}")
+
+    @filter.command("精灵图鉴")
+    async def rocom_atlas(self, event: AstrMessageEvent, name: str = ""):
+        """查询本地 Atlas 精灵图鉴图片"""
+        name = str(name or "").strip()
+        if not name:
+            yield event.plain_result("请输入精灵名称。用法：/精灵图鉴 <精灵名>")
+            return
+        if not self._atlas_ready():
+            yield event.plain_result(
+                "本地图鉴尚未下载，请先运行 /图鉴下载。\n"
+                "图鉴图片会下载到 AstrBot 插件数据目录，不会写入插件目录。\n"
+                "提示：Rocom-Atlas 图库仍在构建中，部分精灵可能暂时缺图。"
+            )
+            return
+        match_name, image_path, candidates = self._find_atlas_match(name)
+        if image_path and os.path.isfile(image_path):
+            yield event.image_result(image_path)
+            return
+        if candidates:
+            lines = [f"找到多个图鉴候选，请使用更精确名称："]
+            lines.extend(f"{idx}. {item}" for idx, item in enumerate(candidates, 1))
+            yield event.plain_result("\n".join(lines))
+            return
         yield event.plain_result(
-            f"洛克 wiki 接口当前已在新版后端文档中暂时关闭，插件侧已暂停调用。\n"
-            f"你查询的是：{name}\n"
-            f"待后端重新开放后会恢复该功能。"
+            f"未找到「{name}」的本地图鉴图片。可运行 /图鉴下载 更新本地图库。\n"
+            f"提示：Rocom-Atlas 图库仍在构建中，缺图不代表 Wiki 中没有该精灵。"
         )
 
-    @filter.command("洛克技能", alias={"技能 wiki"})
-    async def rocom_skill(self, event: AstrMessageEvent, name: str = "圣光斩"):
-        """查询技能 wiki"""
-        yield event.plain_result(
-            f"技能 wiki 接口当前已在新版后端文档中暂时关闭，插件侧已暂停调用。\n"
-            f"你查询的是：{name}\n"
-            f"待后端重新开放后会恢复该功能。"
+    @filter.command("洛克wiki", alias={"洛克百科"})
+    async def rocom_wiki(self, event: AstrMessageEvent, name: str = ""):
+        """查询 Wiki"""
+        catalog, query, page_no = self._parse_wiki_command(event, name)
+        raw_text = self._extract_command_args_text(event, ["洛克wiki", "洛克百科"]) or str(name or "").strip()
+        raw_key = raw_text.strip().lower()
+        catalogs_meta = await self._get_wiki_catalogs_payload()
+
+        if not raw_text or raw_key in {"帮助", "help", "类型", "目录", "专题"}:
+            options_meta = await self._get_wiki_options_payload()
+            data = self._build_wiki_catalog_render_data(catalogs_meta, options_meta)
+            img_url = await self.renderer.render_html(
+                "render/wiki/menu/index.html",
+                data,
+                {"device_scale_factor": 1.35, "viewport_width": 1280, "viewport_height": 1500},
+            )
+            if img_url:
+                yield event.image_result(img_url)
+            else:
+                yield event.plain_result(self._wiki_catalog_usage_text())
+            return
+
+        if catalog:
+            catalog = self._wiki_catalog_for_key_from_payload(str(catalog.get("key") or ""), catalogs_meta) or catalog
+
+        if catalog is None:
+            parts, parsed_page_no = self._split_wiki_command_parts(raw_text)
+            if parts:
+                dynamic_catalog = self._wiki_dynamic_catalog_by_token(parts[0], catalogs_meta)
+                if dynamic_catalog:
+                    catalog = dynamic_catalog
+                    query = " ".join(parts[1:]).strip()
+                    page_no = parsed_page_no
+
+        if catalog is None:
+            payload, mode, error = await self._fetch_global_wiki_search(query, page_no)
+            if error:
+                yield event.plain_result(error)
+                return
+
+            if mode == "global-detail":
+                source_catalog = payload.get("_catalog") if isinstance(payload, dict) else {}
+                detail = payload.get("item") if isinstance(payload, dict) and isinstance(payload.get("item"), dict) else {}
+                source_key = str((source_catalog or {}).get("key") or "")
+                if source_key == "pets":
+                    pet_id = detail.get("pet_id")
+                    profile, skills, family, handbook = await self._fetch_wiki_pet_sections(pet_id)
+                    data = self._build_wiki_render_data(detail, profile, skills, family, handbook, query)
+                    img_url = await self.renderer.render_html(
+                        "render/wiki/pet/index.html",
+                        data,
+                        {"device_scale_factor": 1.4, "viewport_width": 1120, "viewport_height": 1500},
+                    )
+                    if img_url:
+                        yield event.image_result(img_url)
+                    else:
+                        yield event.plain_result(
+                            f"{data['name']} #{data['number']}\n"
+                            f"属性：{' / '.join(data['type_names']) or '暂无'}\n"
+                            f"蛋组：{' / '.join(data['egg_groups']) or '暂无'}\n"
+                            f"{data['description']}"
+                        )
+                    return
+                if source_key == "skills":
+                    pets = await self.client.get_wiki_skill_pets(detail.get("skill_id"))
+                    data = self._build_skill_render_data(detail, pets if isinstance(pets, dict) else {}, query)
+                    img_url = await self.renderer.render_html(
+                        "render/wiki/skill/index.html",
+                        data,
+                        {"device_scale_factor": 1.4, "viewport_width": 960, "viewport_height": 1200},
+                    )
+                    if img_url:
+                        yield event.image_result(img_url)
+                    else:
+                        yield event.plain_result(f"{data['name']} #{data['skill_id']}\n{data['description']}")
+                    return
+                data = self._build_generic_wiki_render_data(source_catalog or {"title": "全局搜索", "key": "global"}, detail, query, "detail", page_no)
+                img_url = await self.renderer.render_html(
+                    "render/wiki/detail/index.html",
+                    data,
+                    {"device_scale_factor": 1.35, "viewport_width": 1280, "viewport_height": 1600},
+                )
+                if img_url:
+                    yield event.image_result(img_url)
+                else:
+                    yield event.plain_result(f"{data['title']}\n{data.get('summary') or ''}")
+                return
+
+            data = self._build_generic_wiki_render_data({"title": "全局搜索", "key": "global"}, payload, query, "global-search", page_no)
+            img_url = await self.renderer.render_html(
+                "render/wiki/list/index.html",
+                data,
+                {"device_scale_factor": 1.35, "viewport_width": 1280, "viewport_height": 1600},
+            )
+            if img_url:
+                yield event.image_result(img_url)
+            else:
+                yield event.plain_result(f"{data['title']}\n{data.get('summary') or ''}")
+            return
+
+        if catalog.get("key") in {"pets", "pet"} and query:
+            overview, candidates, error = await self._resolve_wiki_pet(query)
+            if error:
+                yield event.plain_result(error)
+                return
+            if candidates:
+                yield event.plain_result(self._wiki_candidate_text(query, candidates, "精灵"))
+                return
+            if not overview:
+                yield event.plain_result("获取 Wiki 精灵详情失败：接口未返回有效数据。")
+                return
+            pet_id = overview.get("pet_id")
+            profile, skills, family, handbook = await self._fetch_wiki_pet_sections(pet_id)
+            data = self._build_wiki_render_data(overview, profile, skills, family, handbook, query)
+            img_url = await self.renderer.render_html(
+                "render/wiki/pet/index.html",
+                data,
+                {"device_scale_factor": 1.4, "viewport_width": 1120, "viewport_height": 1500},
+            )
+            if img_url:
+                yield event.image_result(img_url)
+            else:
+                yield event.plain_result(f"{data['name']} #{data['number']}\n{data['description']}")
+            return
+
+        if catalog.get("key") in {"skills", "skill"} and query:
+            detail, candidates, error = await self._resolve_wiki_skill(query)
+            if error:
+                yield event.plain_result(error)
+                return
+            if candidates:
+                yield event.plain_result(self._wiki_candidate_text(query, candidates, "技能"))
+                return
+            if not detail:
+                yield event.plain_result("获取技能详情失败：接口未返回有效数据。")
+                return
+            pets = await self.client.get_wiki_skill_pets(detail.get("skill_id"))
+            data = self._build_skill_render_data(detail, pets if isinstance(pets, dict) else {}, query)
+            img_url = await self.renderer.render_html(
+                "render/wiki/skill/index.html",
+                data,
+                {"device_scale_factor": 1.4, "viewport_width": 960, "viewport_height": 1200},
+            )
+            if img_url:
+                yield event.image_result(img_url)
+            else:
+                yield event.plain_result(f"{data['name']} #{data['skill_id']}\n{data['description']}")
+            return
+
+        payload, mode, error = await self._fetch_generic_wiki_catalog(catalog, query, page_no)
+        if error:
+            yield event.plain_result(error)
+            return
+        data = self._build_generic_wiki_render_data(catalog, payload, query, mode, page_no)
+        template_name = "render/wiki/detail/index.html"
+        if mode == "list":
+            template_name = "render/wiki/list/index.html"
+        elif mode == "suggestions":
+            template_name = "render/wiki/suggestions/index.html"
+        img_url = await self.renderer.render_html(
+            template_name,
+            data,
+            {"device_scale_factor": 1.35, "viewport_width": 1280, "viewport_height": 1600},
         )
+        if img_url:
+            yield event.image_result(img_url)
+        else:
+            yield event.plain_result(f"{data['title']}\n{data.get('summary') or ''}")
+
+    @filter.command("洛克公告")
+    async def rocom_announcement_list(self, event: AstrMessageEvent, page: int = 1):
+        """查询洛克王国公告列表"""
+        try:
+            page = max(int(page or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        res = await self.client.get_announcement_list(page=page, limit=8)
+        if not res:
+            yield event.plain_result(f"获取公告列表失败：{self.client.get_last_error()}")
+            return
+        data = self._build_announcement_list_render_data(res)
+        img_url = await self.renderer.render_html(
+            "render/announcement/list.html",
+            data,
+            {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
+        )
+        if img_url:
+            yield event.image_result(img_url)
+        else:
+            titles = [item.get("title", "未命名公告") for item in (res.get("list") or res.get("items") or [])[:8]]
+            yield event.plain_result("公告列表：\n" + "\n".join(titles))
+
+    @filter.command("洛克公告详情")
+    async def rocom_announcement_detail(self, event: AstrMessageEvent, thread_id: str = ""):
+        """查询洛克王国公告详情"""
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            yield event.plain_result("请提供公告 ID。用法：/洛克公告详情 <公告ID>")
+            return
+        res = await self.client.get_announcement_detail(thread_id)
+        if not res:
+            yield event.plain_result(
+                f"获取公告详情失败：{self.client.get_last_error()}\n请注意公告 ID 是否正确。"
+            )
+            return
+        data = self._build_announcement_detail_render_data(res)
+        img_url = await self.renderer.render_html(
+            "render/announcement/detail.html",
+            data,
+            {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
+        )
+        if img_url:
+            yield event.image_result(img_url)
+        else:
+            yield event.plain_result(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}")
+
+    @filter.command("洛克公告最新")
+    async def rocom_announcement_latest(self, event: AstrMessageEvent):
+        """查询最新洛克王国公告"""
+        res = await self.client.get_announcement_latest()
+        if not res:
+            yield event.plain_result(f"获取最新公告失败：{self.client.get_last_error()}")
+            return
+        detail = await self.client.get_announcement_detail(self._announcement_id(res)) or res
+        data = self._build_announcement_detail_render_data(detail)
+        img_url = await self.renderer.render_html(
+            "render/announcement/detail.html",
+            data,
+            {"device_scale_factor": 1.5, "viewport_width": 1100, "viewport_height": 1200},
+        )
+        if img_url:
+            yield event.image_result(img_url)
+        else:
+            yield event.plain_result(f"{data['title']}\n{data.get('summary') or '该公告暂无摘要。'}")
+
+    @filter.command("洛克活动日历", alias={"洛克活动", "洛克日历"})
+    async def rocom_activity_calendar(self, event: AstrMessageEvent):
+        """查询洛克王国活动日历"""
+        res = await self.client.get_activities_info()
+        if not res:
+            yield event.plain_result(f"获取活动日历失败：{self.client.get_last_error()}")
+            return
+        data = self._build_activity_calendar_render_data(res)
+        if data.get("empty"):
+            yield event.plain_result("当前没有可展示的洛克王国活动。")
+            return
+        img_url = await self.renderer.render_html(
+            "render/activity-calendar/index.html",
+            data,
+            {"device_scale_factor": 1.0, "viewport_width": 2200, "viewport_height": 900},
+        )
+        if img_url:
+            yield event.image_result(img_url)
+        else:
+            names = [item["name"] for lane in data.get("lanes", []) for item in lane][:10]
+            yield event.plain_result("活动日历：\n" + "\n".join(names))
+
+    @filter.command("订阅洛克公告")
+    async def subscribe_announcement(self, event: AstrMessageEvent):
+        """订阅洛克王国新公告提醒"""
+        if not event.is_private_chat() and not await self._is_group_admin(event):
+            yield event.plain_result("仅当前群管理员可以配置洛克公告订阅。")
+            return
+        key = str(event.unified_msg_origin)
+        latest = await self.client.get_announcement_latest()
+        latest_id = self._announcement_id(latest) if latest else ""
+        latest_ts = self._announcement_ts(latest) if latest else int(time.time())
+        await self.announcement_sub_mgr.upsert_subscription(
+            key,
+            {
+                "key": key,
+                "umo": event.unified_msg_origin,
+                "updated_by": str(event.get_sender_id()),
+                "last_id": latest_id,
+                "since_ts": latest_ts,
+                "updated_at": int(time.time()),
+            },
+        )
+        yield event.plain_result("已订阅洛克公告，新公告发布后会推送到当前会话。")
+
+    @filter.command("取消订阅洛克公告")
+    async def unsubscribe_announcement(self, event: AstrMessageEvent):
+        """取消洛克王国新公告提醒"""
+        if not event.is_private_chat() and not await self._is_group_admin(event):
+            yield event.plain_result("仅当前群管理员可以取消洛克公告订阅。")
+            return
+        key = str(event.unified_msg_origin)
+        deleted = await self.announcement_sub_mgr.delete_subscription(key)
+        if deleted:
+            yield event.plain_result("已取消当前会话的洛克公告订阅。")
+        else:
+            yield event.plain_result("当前会话没有洛克公告订阅。")
 
     @filter.command("远行商人", alias={"yxsr"})
     async def rocom_merchant(self, event: AstrMessageEvent):
@@ -3157,16 +6329,20 @@ class RocomPlugin(Star):
 
     @filter.command("洛克玩家")
     async def rocom_player_search(self, event: AstrMessageEvent, uid: str = ""):
-        """通过 ingame 接口搜索玩家"""
-        uid = str(uid or "").strip()
-        if not uid:
-            yield event.plain_result("请提供玩家 UID。用法：/洛克玩家 <UID>")
+        """通过 ingame 接口搜索玩家，未传 UID 时查询当前绑定账号"""
+        uid, fw_token, user_identifier = await self._resolve_ingame_identity(event, uid)
+        if not uid and not fw_token:
+            yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克玩家。")
             return
-        res = await self.client.ingame_player_search(uid)
+        res = await self.client.ingame_player_search(
+            uid,
+            fw_token=fw_token,
+            user_identifier=user_identifier,
+        )
         if not res:
             yield event.plain_result(f"玩家搜索失败：{self.client.get_last_error()}")
             return
-        data = self._build_player_search_render_data(res, uid)
+        data = self._build_player_search_render_data(res, uid or "当前绑定")
         img_url = await self.renderer.render_html("render/player-search/index.html", data)
         if img_url:
             yield event.image_result(img_url)
@@ -3176,15 +6352,19 @@ class RocomPlugin(Star):
     @filter.command("洛克家园")
     async def rocom_home(self, event: AstrMessageEvent, uid: str = ""):
         """通过 UID 查询洛克家园菜园、守卫精灵与室内精灵"""
-        uid = await self._resolve_home_uid(event, uid)
-        if not uid:
+        uid, fw_token, user_identifier = await self._resolve_ingame_identity(event, uid)
+        if not uid and not fw_token:
             yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /洛克家园。")
             return
-        res = await self.client.ingame_home_info(uid)
+        res = await self.client.ingame_home_info(
+            uid,
+            fw_token=fw_token,
+            user_identifier=user_identifier,
+        )
         if not res:
             yield event.plain_result(f"家园查询失败：{self.client.get_last_error()}")
             return
-        data = self._build_home_render_data(res, uid)
+        data = self._build_home_render_data(res, uid or "当前绑定")
         img_url = await self.renderer.render_html(
             "render/home/index.html",
             data,
@@ -3192,12 +6372,103 @@ class RocomPlugin(Star):
                 "device_scale_factor": 3,
                 "viewport_width": 1500,
                 "viewport_height": 1200,
+                "image_format": "jpeg",
+                "image_quality": 82,
             },
         )
         if img_url:
             yield event.image_result(img_url)
         else:
             yield event.plain_result(self._format_json_payload(res))
+
+    @filter.command("家园详情", alias={"洛克精灵数据", "精灵数据"})
+    async def rocom_pet_data(self, event: AstrMessageEvent, uid: str = "", pet_gid: str = "", npc_id: str = ""):
+        """查询目标家园摆放精灵的完整 ingame 数据"""
+        uid = str(uid or "").strip()
+        pet_gid = str(pet_gid or "").strip()
+        npc_id = str(npc_id or "").strip()
+        if (pet_gid and not npc_id) or (npc_id and not pet_gid):
+            yield event.plain_result(
+                "请同时提供 pet_gid 和 npc_id。用法：/家园详情 <UID> 或 /家园详情 <UID> <pet_gid> <npc_id>\n"
+                "提示：该接口依赖目标玩家在线，npc_id 也可以使用 furniture_guid。"
+            )
+            return
+        uid, fw_token, user_identifier = await self._resolve_ingame_identity(event, uid)
+        if not uid and not fw_token:
+            yield event.plain_result("请提供玩家 UID，或先完成绑定后使用 /家园详情。目标玩家需要在线。")
+            return
+
+        res = await self.client.ingame_pet_data(
+            uid,
+            pet_gid=pet_gid,
+            npc_id=npc_id,
+            fw_token=fw_token,
+            user_identifier=user_identifier,
+        )
+        if not res:
+            yield event.plain_result(
+                f"家园详情查询失败：{self.client.get_last_error()}\n"
+                "提示：该接口需要目标玩家在线，且目标家园可访问；离线时通常无法获取完整数据。"
+            )
+            return
+
+        options_meta, skill_lookup, size_lookup = await asyncio.gather(
+            self._get_wiki_options_payload(),
+            self._pet_data_wiki_skill_lookup(res),
+            self._pet_data_wiki_size_lookup(res),
+        )
+        data = self._build_pet_data_render_data(
+            res,
+            uid or "当前绑定",
+            options=options_meta,
+            skill_lookup=skill_lookup,
+            size_lookup=size_lookup,
+            single_query=bool(pet_gid and npc_id),
+            low_bandwidth_mode=self.low_bandwidth_mode,
+        )
+        render_options = {
+            "device_scale_factor": 2,
+            "viewport_width": 1500,
+            "viewport_height": 1200,
+            "image_format": "jpeg",
+            "image_quality": 84,
+        }
+        if self.low_bandwidth_mode:
+            render_options.update(
+                {
+                    "device_scale_factor": 1,
+                    "viewport_width": 1400,
+                    "viewport_height": 1000,
+                    "image_quality": 72,
+                    "image_wait_timeout": 2000,
+                    "screenshot_timeout": 20000,
+                    "screenshot_scale": "css",
+                }
+            )
+        img_url = await self.renderer.render_html(
+            "render/pet-data/index.html",
+            data,
+            render_options,
+        )
+        if img_url:
+            yield event.image_result(img_url)
+            return
+
+        lines = [
+            f"家园详情 - UID {data['uid']}（{data['onlineText']}）",
+            data["notice"],
+        ]
+        for pet in data.get("pets", [])[:8]:
+            lines.append(
+                f"{pet['index']}. {pet['name']} Lv.{pet['level']} #{pet['baseId']} "
+                f"{pet['variantText']} 分贝 {pet.get('voiceText', '--')}"
+            )
+        if not data.get("pets"):
+            lines.append(data["emptyText"])
+        lines.append("")
+        lines.append("若服务器带宽过小导致生成超时，请在配置项打开低带宽模式。")
+        lines.append("低带宽模式开启后，家园详情将不再加载技能图标。")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("订阅家园菜园")
     async def subscribe_home_garden(self, event: AstrMessageEvent, uid: str = ""):
@@ -3251,19 +6522,47 @@ class RocomPlugin(Star):
         )
         yield event.plain_result(f"已订阅 UID {uid} 的家园精灵灵感提醒：首个完成和全部完成时各推送一次。")
 
+    @filter.command("订阅家园生蛋")
+    async def subscribe_home_egg(self, event: AstrMessageEvent, uid: str = ""):
+        """订阅家园精灵生蛋提醒"""
+        if not event.is_private_chat() and not await self._is_group_admin(event):
+            yield event.plain_result("仅当前群管理员可以配置家园生蛋订阅。")
+            return
+        uid = await self._resolve_home_uid(event, uid)
+        if not uid:
+            yield event.plain_result("请提供玩家 UID，或先完成绑定后再订阅家园生蛋。")
+            return
+        key = self._home_subscription_key(event.unified_msg_origin, uid, "egg")
+        await self.home_sub_mgr.upsert_subscription(
+            key,
+            {
+                "key": key,
+                "kind": "egg",
+                "uid": uid,
+                "umo": event.unified_msg_origin,
+                "updated_by": str(event.get_sender_id()),
+                "sent_event_ids": [],
+                "notify_state": {"first": False, "all": False},
+                "updated_at": int(time.time()),
+            },
+        )
+        yield event.plain_result(f"已订阅 UID {uid} 的家园精灵生蛋提醒：首个可领取和全部可领取时各推送一次。")
+
     @filter.command("取消订阅家园")
     async def unsubscribe_home(self, event: AstrMessageEvent, kind: str = "全部", uid: str = ""):
-        """取消家园菜园或灵感订阅"""
+        """取消家园菜园、灵感或生蛋订阅"""
         if not event.is_private_chat() and not await self._is_group_admin(event):
             yield event.plain_result("仅当前群管理员可以取消家园订阅。")
             return
         kind_map = {
             "菜园": "garden",
             "灵感": "inspiration",
+            "生蛋": "egg",
             "全部": "",
             "all": "",
             "garden": "garden",
             "inspiration": "inspiration",
+            "egg": "egg",
         }
         selected_kind = kind_map.get(str(kind or "全部").strip(), "")
         deleted = await self.home_sub_mgr.delete_matching(
@@ -3765,13 +7064,16 @@ class RocomPlugin(Star):
             text_result = None
 
             if use_backend_size_query:
-                results = await self.client.query_pet_size(height_m if height_m is not None else height / 100, weight)
+                query_height_m = height_m if height_m is not None else height / 100
+                results = await self.client.search_egg_by_size(query_height_m, weight)
+                if results is None:
+                    results = await self.client.query_pet_size(query_height_m, weight)
                 if results is not None:
                     data = self.egg_searcher.build_size_search_data_from_api(
-                        height, weight, results
+                        height, weight, results, height_display=height_display
                     )
                     text_result = self.egg_searcher.build_size_search_text_from_api(
-                        height, weight, results
+                        height, weight, results, height_display=height_display
                     )
 
             if data is None:
@@ -3794,6 +7096,83 @@ class RocomPlugin(Star):
         name = " ".join(name_parts)
         if not name:
             yield event.plain_result("请输入精灵名称。用法：/洛克查蛋 <精灵名>")
+            return
+
+        egg_group_result = await self.client.get_egg_pet_groups(name, limit=20)
+        if egg_group_result is not None:
+            backend_items = (egg_group_result or {}).get("items") or []
+            if not backend_items:
+                yield event.plain_result(f"❌ 未找到名为「{name}」的精灵，请检查名称后重试。")
+                return
+
+            selected = None
+            for item in backend_items:
+                item_name = str(item.get("name") or "").strip()
+                item_form = str(item.get("form") or "").strip()
+                item_display = self.egg_searcher._egg_pet_display_name(item)
+                if (
+                    str(item.get("id") or "") == name
+                    or item_name == name
+                    or item_display == name
+                    or (item_form and f"{item_name}{item_form}" == name)
+                ):
+                    selected = item
+                    break
+            if selected is None and len(backend_items) == 1:
+                selected = backend_items[0]
+            if selected is None:
+                data = self.egg_searcher.build_candidates_render_data_from_egg_api(
+                    name, backend_items
+                )
+                img_url = await self.renderer.render_html("render/searcheggs/candidates.html", data)
+                if img_url:
+                    yield event.image_result(img_url)
+                else:
+                    names = "\n".join(
+                        f"{idx}. {self.egg_searcher._egg_pet_display_name(item)} #{item.get('id') or '-'}"
+                        for idx, item in enumerate(backend_items[:10], 1)
+                    )
+                    yield event.plain_result(
+                        f"找到多个查蛋候选，请使用更精确名称：\n\n{names}"
+                    )
+                return
+
+            compatible_by_group: Dict[Any, Any] = {}
+            group_ids = []
+            for group in selected.get("egg_groups") or []:
+                if not isinstance(group, dict):
+                    continue
+                group_id = group.get("group_id") or group.get("id")
+                if group_id:
+                    group_ids.append(group_id)
+            if group_ids:
+                compatible_by_group["__all__"] = await self.client.get_egg_group_pets(
+                    group_ids, match_mode="any", page_no=1, page_size=1
+                ) or {}
+            for group in selected.get("egg_groups") or []:
+                group_id = group.get("group_id") or group.get("id") if isinstance(group, dict) else None
+                if not group_id:
+                    continue
+                group_res = await self.client.get_egg_group_pets(
+                    [group_id], match_mode="any", page_no=1, page_size=60
+                )
+                compatible_by_group[group_id] = group_res or {}
+                await asyncio.sleep(0.2)
+            data = self.egg_searcher.build_search_data_from_egg_api(
+                selected, compatible_by_group
+            )
+            data["commandHint"] = "💡 数据来自后端查蛋模块；后端不可用时自动回退本地查蛋"
+            data["copyright"] = "AstrBot & WeGame Locke Kingdom Plugin"
+            img_url = await self.renderer.render_html("render/searcheggs/index.html", data)
+            if img_url:
+                yield event.image_result(img_url)
+            else:
+                yield event.plain_result(
+                    f"🥚 {data['pet_name']} (#{data['pet_id']})\n"
+                    f"属性：{data['type_label']}\n"
+                    f"蛋组：{data['egg_groups_label']}\n"
+                    f"可配种精灵数：{data['total_compatible']}"
+                )
             return
 
         sr = self.egg_searcher.search(name)

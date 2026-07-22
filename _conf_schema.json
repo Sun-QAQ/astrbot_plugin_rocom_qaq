@@ -2,7 +2,7 @@
   "wegame_api_key": {
     "type": "string",
     "description": "API Key",
-    "hint": "API 密钥，请暂时使用测试key，加群等待前端完毕后用正式key",
+    "hint": "API 密钥，在https://rocom.shallow.ink申请，只用远行商人一块钱能用俩月",
     "default": ""
   },
   "api_base_url": {
@@ -16,6 +16,12 @@
     "description": "渲染超时时间",
     "hint": "图片渲染最大等待时间（毫秒）",
     "default": 30000
+  },
+  "low_bandwidth_mode": {
+    "type": "bool",
+    "description": "低带宽模式",
+    "hint": "默认关闭。开启后，家园详情渲染时不再加载技能图标，适合服务器带宽较小或访问远程资源较慢的环境",
+    "default": false
   },
   "help_prefix_display": {
     "type": "string",
@@ -115,5 +121,17 @@
     "description": "家园订阅检查间隔",
     "hint": "单位：分钟。用于菜园成熟和精灵灵感订阅轮询",
     "default": 5
+  },
+  "announcement_subscription_enabled": {
+    "type": "bool",
+    "description": "启用洛克公告订阅推送",
+    "hint": "开启后定时检查最新公告，并向已订阅会话推送新公告",
+    "default": true
+  },
+  "announcement_poll_interval_minutes": {
+    "type": "int",
+    "description": "洛克公告订阅检查间隔",
+    "hint": "单位：分钟。用于新公告订阅轮询",
+    "default": 10
   }
 }

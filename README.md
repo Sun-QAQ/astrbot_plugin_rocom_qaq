@@ -1,20 +1,19 @@
 <div align="center">
 
 # 🏰 astrbot\_plugin\_rocom
-# 由于前端正在构建，正式发布前端前可使用测试key，加群等待申请key， 群号：[1097809141](https://qm.qq.com/q/8SuHC3siIM) 
-# 测试key：sk-ff14f964051a5c966564e29b5bd3a768
+### [key申请点这里](https://rocom.shallow.ink/) 反馈群号：[1097809141](https://qm.qq.com/q/8SuHC3siIM) 
 ### *WeGame 洛克王国数据查询*
 
-<img src="https://github.com/user-attachments/assets/446759b3-c9d8-4752-800c-acf47d55e70f" width="400" alt="LOGO">
+<img src="./logo.png" width="400" height="400" alt="logo" />
 
 [![GitHub stars](https://img.shields.io/github/stars/Entropy-Increase-Team/astrbot_plugin_rocom?style=for-the-badge\&color=FFc65f)](https://github.com/Entropy-Increase-Team/astrbot_plugin_rocom/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/Entropy-Increase-Team/astrbot_plugin_rocom?style=for-the-badge\&color=d88124)](https://github.com/Entropy-Increase-Team/astrbot_plugin_rocom/network)
 [![GitHub issues](https://img.shields.io/github/issues/Entropy-Increase-Team/astrbot_plugin_rocom?style=for-the-badge\&color=45B7D1)](https://github.com/Entropy-Increase-Team/astrbot_plugin_rocom/issues)
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-FFc65f?style=for-the-badge\&logo=python)](https://github.com/Soulter/AstrBot)
 
-### 🚀 基于 WeGame API & 洛克王国数据 的查询工具 v3.1.1
+### 🚀 基于 WeGame API & 洛克王国数据 的查询工具 v3.8.0
 
-### 扫码绑定 · 个人档案 · 家园查询 · 最近战绩 · 精灵背包 · 阵容助手
+### 扫码绑定 · 个人档案 · 家园查询 · 公告推送 · 最近战绩 · 精灵背包 · 阵容助手
 
 **如果这个插件对你有帮助，请点亮⭐支持一下！**
 
@@ -43,17 +42,19 @@
 
 ✅ **消息撤回** - 登录链接与二维码超时、完成或被拒时自动撤回，保护账号安全
 
-✅ **数据查询** - 个人档案可视化渲染、家园菜园/守卫/室内精灵、近期对战详情、背包精灵图鉴检索、交换大厅、远行商人、阵容推荐
+✅ **数据查询** - 个人档案可视化渲染、家园菜园/守卫/室内精灵、家园精灵完整数据、活动日历、公告查询与推送、近期对战详情、背包精灵图鉴检索、交换大厅、远行商人、阵容推荐
 
-✅ **查蛋配种** - 离线蛋组查询、配种兼容性判断，支持精确/模糊/多候选智能匹配，并接入后端尺寸反查
+✅ **Wiki 与图鉴** - 接入新版后端 Wiki API，目录与筛选项由后端实时返回，支持全局搜索、分类查询与本地 Rocom-Atlas 图鉴图片下载查询
+
+✅ **查蛋配种** - 后端查蛋模块优先查询、离线蛋组兜底、配种兼容性判断，支持精确/模糊/多候选智能匹配，并接入新版蛋尺寸反查与大小块头标记
 
 ✅ **图片展示** - 深度还原 WeGame 各级视觉效果的排版与艺术风格字体字形重绘，自带自适应宽度渲染
 
 ✅ **阵容助手** - 热门阵容推荐、2x3 网格布局展示、阵容码查询、详细技能配置
 
-✅ **Ingame 查询** - 支持玩家搜索、商店信息、好友关系、学生认证与学生活动等新版文档接口
+✅ **Ingame 查询** - 支持新版队列化玩家搜索、家园查询、商店信息、好友关系、学生认证与学生活动等文档接口
 
-⚠️ **Wiki 状态** - 由于新版后端文档已暂时移除 wiki 接口说明，插件当前仅保留命令占位并提醒接口暂时关闭
+✅ **本地资源** - 字体和 Rocom-Atlas 图鉴图片均下载到 AstrBot 插件数据目录，不塞入插件包体积
 
 ***
 
@@ -88,12 +89,15 @@ playwright install chromium
 | `merchant_subscription_retry_delay_seconds` | int | `240` | 空结果重试间隔（秒） |
 | `merchant_subscription_retry_times` | int | `3` | 空结果最大重试次数 |
 | `merchant_subscription_jitter_seconds` | int | `30` | 订阅检查随机延后、空结果重试前后随机抖动（秒） |
+| `low_bandwidth_mode` | bool | `false` | 低带宽模式；开启后 `/家园详情` 不再加载技能图标，适合服务器带宽较小或访问远程资源较慢的环境 |
 | `merchant_subscription_items` | list | `["国王球","棱镜球","炫彩精灵蛋"]` | 远行商人默认订阅商品 |
 | `merchant_private_subscription_enabled` | bool | `true` | 是否允许用户在私聊中订阅远行商人推送 |
 | `merchant_subscription_push_without_match` | bool | `false` | 是否在未命中订阅商品时仍推送远行商人当轮信息 |
 | `show_other_time_slots_today` | bool | `true` | 是否在远行商人渲染页展示“今日其他时段”区域 |
 | `home_subscription_enabled` | bool | `true` | 是否启用家园菜园和精灵灵感订阅推送 |
 | `home_subscription_interval_minutes` | int | `5` | 家园订阅检查间隔（分钟），按首个完成/全部完成两档推送 |
+| `announcement_subscription_enabled` | bool | `true` | 是否启用洛克公告订阅推送 |
+| `announcement_poll_interval_minutes` | int | `10` | 洛克公告订阅检查间隔（分钟） |
 
 ### 安全免责声明
 
@@ -115,10 +119,9 @@ astrbot_plugin_rocom/
 │   ├── client.py           # API 异步客户端
 │   ├── user.py             # 用户数据中心
 │   └── render.py           # HTML 渲染助手
-├── data/                   # 持久化存储
-│   └── users.json          # 用户绑定数据
+├── docs/preview/           # README 功能预览压缩图
 ├── img/                    # 各项渲染所需依赖底图
-├── ttf/                    # 无衬线免税字体库
+├── ttf/                    # 字体占位目录，运行时自动下载字体到插件数据目录
 └── render/                 # 网页模板资源
     ├── bind-list/          # 绑定列表与多账号面板模板
     ├── menu/               # 帮助菜单模板
@@ -126,19 +129,23 @@ astrbot_plugin_rocom/
     ├── personal-card/      # 洛克档案面板模板
     ├── record/             # 对战回放数据模板
     ├── exchange-hall/      # 洛克交换大厅模板
+    ├── announcement/       # 洛克公告列表与详情模板
+    ├── activity-calendar/  # 洛克活动日历模板
     ├── home/               # 洛克家园菜园/守卫/室内精灵模板
-    ├── pet-wiki/           # 精灵 wiki 模板
-    ├── skill-wiki/         # 技能 wiki 模板
+    ├── pet-data/           # ingame pet/data 家园精灵完整数据模板
+    ├── wiki/               # Wiki 菜单、列表、详情、联想、精灵/技能模板
     ├── yuanxing-shangren/  # 远行商人模板
     ├── lineup/             # 洛克阵容助手模板
     ├── lineup-detail/      # 阵容详情模板
     └── searcheggs/         # 🥚 查蛋配种模块（自包含）
         ├── eggs.py         # 查蛋引擎（搜索/蛋组/配种逻辑）
-        ├── Pets.json       # 精灵蛋组离线数据（1015只）
+        ├── Pets.json       # 精灵蛋组离线数据（1065只）
         ├── index.html      # 单精灵查蛋渲染模板
         ├── pair.html       # 配种判定渲染模板
         └── style.css       # 查蛋页面样式
 ```
+
+> 用户绑定、订阅、字体缓存与 Rocom-Atlas 图鉴缓存会写入 `AstrBot/data/plugin_data/astrbot_plugin_rocom/`，不会塞进插件包。
 
 ***
 
@@ -148,7 +155,6 @@ astrbot_plugin_rocom/
 > 
 > ⚠️ **帮助菜单说明**
 > - 标注 `实验性功能` 的命令表示接口字段或返回结构暂不稳定，适合测试使用
-> - 标注 `接口暂时关闭` / `暂不可用` 的命令表示当前后端未开放，仅返回提示信息
 
 ### 🔐 账号与绑定
 
@@ -171,27 +177,39 @@ astrbot_plugin_rocom/
 | `洛克背包 [分类] [页码]` | 展示对应条件精选收藏情况，支持分类如 `了不起`、`异色`、`炫彩` 等 |
 | `洛克交换大厅 [页码]`    | 浏览其他玩家的精灵交换请求列表                      |
 | `远行商人/yxsr` | 查询当前轮次远行商人商品 |
+| `洛克公告 [页码]` | 查询洛克王国公告列表 |
+| `洛克公告详情 <公告ID>` | 查看指定公告详情 |
+| `洛克公告最新` | 查看最新一条公告 |
+| `洛克活动日历` | 查询 `activities/info` 活动日历（别名：`洛克活动`、`洛克日历`） |
+| `订阅洛克公告` | 订阅新公告推送（群聊需群主/群管理员/bot管理员） |
+| `取消订阅洛克公告` | 关闭当前会话的新公告推送 |
 | `洛克商店 <shop_id>` | 实验性功能：通过 ingame 接口查询指定商店信息，接口返回暂不稳定 |
-| `洛克玩家 <UID>` | 通过 ingame 接口查询玩家基础资料，当前推荐优先使用 |
+| `洛克玩家 [UID]` | 通过 ingame 队列接口查询玩家基础资料，不填 UID 时查询当前绑定账号 |
 | `洛克家园 [UID]` | 通过 UID 查询自己或他人的家园菜园、守卫精灵和室内精灵情况 |
+| `家园详情 [UID] [pet_gid] [npc_id]` | 通过 `ingame/pet/data` 查询目标家园摆放精灵完整数据；展示分贝、大块头/小块头、六维和技能等信息；目标玩家需要在线，单只查询时 `npc_id` 可使用 `furniture_guid` |
 | `订阅家园菜园 [UID]` | 订阅指定 UID 的菜园提醒，首个成熟和全部成熟时各推送一次 |
 | `订阅家园灵感 [UID]` | 订阅指定 UID 的精灵灵感提醒，首个完成和全部完成时各推送一次 |
-| `取消订阅家园 [菜园/灵感/全部] [UID]` | 取消当前会话的家园订阅 |
+| `订阅家园生蛋 [UID]` | 订阅指定 UID 的精灵生蛋提醒，首个可领取和全部可领取时各推送一次 |
+| `取消订阅家园 [菜园/灵感/生蛋/全部] [UID]` | 取消当前会话的家园订阅 |
 | `订阅远行商人 [1/0] [商品...]` | 群主/群管理员/bot管理员可订阅远行商人提醒，`1` 为命中后 `@全体`，`0` 为普通提醒；不填商品则使用 WebUI 默认订阅商品 |
 | `取消订阅远行商人` | 关闭当前群远行商人订阅 |
 | `洛克好友关系 <id1,id2>` | 实验性功能：仅能拿到有限状态字段，关系说明暂不稳定（需登录） |
 | `洛克学生 [area] [account_type]` | 实验性功能：接口信息量有限，当前仅供测试查看（需登录） |
 | `洛克阵容 <分类> <页码>` | 查看热门阵容推荐及组成，2x3 网格布局展示               |
 | `查看阵容 <阵容码>`     | 查看指定阵容的详细信息，包含精灵技能配置                 |
-| `洛克wiki <精灵名>` | 暂不可用：接口暂时关闭，当前返回提示信息 |
-| `洛克技能 <技能名>` | 暂不可用：接口暂时关闭，当前返回提示信息 |
+| `图鉴下载` | 从 Rocom-Atlas 下载精灵图鉴图片、索引和 `othername/pets.yaml` 别名表到 AstrBot 插件数据目录；下载过程每 20% 推送一次进度 |
+| `精灵图鉴 <精灵名>` | 仅查询本地 Rocom-Atlas 精灵图鉴图片，按 `othername/pets.yaml` 支持火花、喵喵等别名映射，不承担 Wiki 数据查询 |
+| `洛克wiki [类型] [关键词/ID]` | 统一 Wiki 查询入口；目录、路径和筛选项来自后端 `/wiki/catalogs` 与 `/wiki/options`，未写类型时进行全局搜索 |
+
+> Wiki 类型来自后端 `catalogs` 接口，可使用中文名或 key，例如 `精灵 / pets`、`技能 / skills`、`物品 / items`、`家具 / furniture`、`种植 / plants` 等。
+> 示例：`/洛克wiki 水灵`、`/洛克wiki 物品 国王球`、`/洛克wiki 技能 圣光斩`、`/洛克wiki furniture 魔法床`、`/洛克wiki plants 作物名`。
 
 ### 🥚 查蛋配种（无需登录）
 
 | 指令                        | 说明                                           |
 | :------------------------ | :------------------------------------------- |
-| `洛克查蛋 <精灵名>`             | 查询精灵蛋组、性别比、孵化信息及同蛋组可配种精灵（别名：`查蛋`）           |
-| `洛克查蛋 0.18 1.5`            | 按身高+体重反查（前身高 m 后体重 kg，双参数时优先走后端尺寸查询）                 |
+| `洛克查蛋 <精灵名>`             | 优先使用后端查蛋模块查询精灵蛋组及同蛋组可配种精灵，接口不可用时使用内置离线数据兜底（别名：`查蛋`）           |
+| `洛克查蛋 0.18 1.5`            | 按身高+体重反查（前身高 m 后体重 kg，双参数时优先走后端查蛋尺寸接口，并标记大小块头）                 |
 | `洛克查蛋 0.18`                | 仅按身高(m)反查                                    |
 | `洛克配种 <父体> <母体>`         | 判断能否配种，默认前父后母，孵蛋结果跟随母体（别名：`配种`）             |
 | `洛克配种 <精灵名>`             | 想要孵出该精灵？查询需要哪些父母组合及性别要求                     |
@@ -207,6 +225,8 @@ astrbot_plugin_rocom/
 <details open>
 <summary>点击展开预览图</summary>
 
+> 需要绑定登录凭证的功能保留历史预览图；无需登录或可用公开 UID 查询的功能使用真实接口结果重新生成，并压缩到 `docs/preview/`。
+
 | `洛克档案` | `洛克战绩` |
 |:---:|:---:|
 | <img width="1888" height="1772" alt="1cdb78b007cb9ac6e013de50a1428af1" src="https://github.com/user-attachments/assets/3079330c-4741-40bc-a317-db3c30aec59f" /> | <img width="1920" height="512" alt="image" src="https://github.com/user-attachments/assets/df897cf8-c16c-4d7a-8d3a-b6b578e6d7a5"> |
@@ -219,21 +239,29 @@ astrbot_plugin_rocom/
 |:---:|:---:|
 | <img width="2440" height="1854" alt="image" src="https://github.com/user-attachments/assets/3fb6f800-cae6-4a1b-9b14-1cc2715e0973"> | <img width="3216" height="3410" alt="db5ac911e2ec8840b3a4c367e59b2b5a" src="https://github.com/user-attachments/assets/1a6b56ae-73c5-4b9f-88b9-71d538a11ff6" /> |
 
-| `远行商人` | `精灵 Wiki` |
+| `洛克 Wiki 菜单` | `精灵 Wiki：水灵` |
 |:---:|:---:|
-| <img width="1640" height="2990" alt="ce90506499021979daa2252d6c6ced7f" src="https://github.com/user-attachments/assets/42736f63-3f0d-43ee-a546-76adf2d58abd" /> | <img width="1840" height="6164" alt="6bd48e838ede2c2784681cef61bb0c76" src="https://github.com/user-attachments/assets/9aa29eca-eb9a-4bab-9664-29c12e5f11e6" /> |
+| <img width="900" height="2380" alt="洛克 Wiki 菜单" src="./docs/preview/wiki-menu.jpg" /> | <img width="900" height="3843" alt="精灵 Wiki：水灵" src="./docs/preview/wiki-pet-shuiling.jpg" /> |
 
-| `技能 Wiki` | `查蛋结果` |
+| `技能 Wiki：水花` | `物品 Wiki：国王球` |
 |:---:|:---:|
-| <img width="1840" height="1484" alt="296f9d0065784d170188c265f168c225" src="https://github.com/user-attachments/assets/ed90833e-3043-45ff-a96b-e328a14d48f1" /> | <img width="1640" height="4646" alt="2253648a42048a2cabf9ee6a18e14fc8" src="https://github.com/user-attachments/assets/76176462-40d5-482a-95b9-9e73df73cd94" /> |
+| <img width="900" height="1303" alt="技能 Wiki：水花" src="./docs/preview/wiki-skill-shuihua.jpg" /> | <img width="900" height="1409" alt="物品 Wiki：国王球" src="./docs/preview/wiki-item-king-ball.jpg" /> |
+
+| `远行商人` | `洛克公告` |
+|:---:|:---:|
+| <img width="900" height="890" alt="远行商人" src="./docs/preview/merchant.jpg" /> | <img width="816" height="3157" alt="洛克公告" src="./docs/preview/announcement-list.jpg" /> |
+
+| `洛克活动日历` | `洛克家园` |
+|:---:|:---:|
+| <img width="980" height="796" alt="洛克活动日历" src="./docs/preview/activity-calendar.jpg" /> | <img width="980" height="1581" alt="洛克家园" src="./docs/preview/home-888888.jpg" /> |
+
+| `家园详情` | `查蛋结果` |
+|:---:|:---:|
+| <img width="980" height="5306" alt="家园详情" src="./docs/preview/pet-data-402796836.jpg" /> | <img width="860" height="1477" alt="查蛋结果：水灵" src="./docs/preview/egg-shuiling.jpg" /> |
 
 | `尺寸反查` | `配种结果` |
 |:---:|:---:|
-| <img width="1640" height="4348" alt="cf5e99b9fd2bef74b4a39cc5c44ba3a3" src="https://github.com/user-attachments/assets/fa6e756e-b7e5-4f7a-9928-75dbb7931b59" /> | <img width="1280" height="952" alt="54c8265461499be1160ccedf6248f3d4_720" src="https://github.com/user-attachments/assets/06e6e587-364d-4fbf-928c-011c42a9f19f" /> |
-
-| `洛克家园` | `预留展示位` |
-|:---:|:---:|
-| <img width="3840" height="3873" alt="d361600220e182b3da02fd9e2e0a0af9" src="https://github.com/user-attachments/assets/8b0dd3bf-6489-4278-a321-780d732a175c" /> | <img width="3840" height="3873" alt="d361600220e182b3da02fd9e2e0a0af9" src="https://github.com/user-attachments/assets/997f79af-dc31-473b-af60-2a820ae75525" /> |
+| <img width="860" height="569" alt="尺寸反查" src="./docs/preview/egg-size-018-15.jpg" /> | <img width="820" height="647" alt="配种结果" src="./docs/preview/egg-pair-shuiling-shuilanlan.jpg" /> |
 
 </details>
 
@@ -266,6 +294,115 @@ astrbot_plugin_rocom/
 
 <details>
 <summary>点击展开版本历史</summary>
+
+### v3.8.0 (2026-07-11)
+
+#### 优化
+- `/洛克查蛋 <精灵名>` 优先对接后端查蛋模块 `/egg/pet-groups` 与 `/egg/group-pets`，本地 `Pets.json` 仅作为后端不可用时的兜底。
+- `/洛克查蛋 <身高> <体重>` 优先使用后端 `/egg/search` 进行尺寸反查，失败后再回退 Wiki 尺寸查询与本地离线数据。
+- 尺寸反查结果按精灵体重范围前 5% / 后 5% 标记小块头与大块头，图片和文字回退结果都会展示标记。
+
+### v3.7.5 (2026-07-07)
+
+#### 修复
+- 修复远行商人等居中模板在截图前调整视口后发生裁剪偏移，导致画面左侧被截断的问题。
+
+#### 验证
+- 使用真实 API 数据测试远行商人、公告、活动日历、Wiki 菜单、玩家搜索、家园、家园详情低带宽模式和商店等主要渲染模板。
+
+### v3.7.3 (2026-07-06)
+
+#### 修复
+- 修复 `/家园详情` 截图超时后 Playwright 页面、上下文和浏览器实例未及时清理，导致 Chromium renderer 残留占用 CPU 的问题。
+
+#### 优化
+- 低带宽模式下 `/家园详情` 会降低截图倍率、JPEG 质量和远程图片等待时间，进一步降低长图生成压力。
+
+### v3.7.2 (2026-07-06)
+
+#### 新增
+- 新增 `low_bandwidth_mode` 低带宽模式；开启后 `/家园详情` 不再加载技能图标，适合服务器带宽较小或远程资源访问较慢的环境。
+
+#### 优化
+- `/家园详情` 图片渲染失败回退文字时，追加低带宽模式开启提示。
+
+### v3.7.1 (2026-07-05)
+
+#### 修复
+- 优化渲染截图流程，改用页面裁剪截图并限制远程图片等待时间，降低长图在慢速资源环境下触发 Playwright 稳定等待超时的概率。
+
+### v3.7.0 (2026-07-05)
+
+#### 优化
+- `/家园详情` 接入 Wiki 精灵体重范围，按体重范围前 5% / 后 5% 标注小块头与大块头，并在体重信息中展示判定阈值。
+- `/家园详情` 基础信息区补充分贝、声线区间提示和体重体型提示，特殊分贝区间会加深色标记，去除调试型 `conf/pet_gid/npc_id/返回码` 展示。
+
+### v3.6.1 (2026-07-05)
+
+#### 新增
+- 新增 `/家园详情 [UID] [pet_gid] [npc_id]`，适配后端 `ingame/pet/data`，支持查询目标家园摆放精灵完整数据。
+
+#### 优化
+- `/家园详情` 补全技能名称和图标，并优化家园精灵数据渲染布局。
+
+### v3.6.0 (2026-07-04)
+
+#### 新增
+- 接入新版 RoCom Wiki API，`/洛克wiki` 作为统一入口支持精灵、技能与其它后端 Wiki 目录查询。
+- `/洛克wiki` 支持无分类全局搜索，并从后端 `/wiki/catalogs` 实时读取目录、接口路径、数量和筛选参数。
+- 新增 `/图鉴下载`，从 `Entropy-Increase-Team/Rocom-Atlas` 下载精灵图鉴图片、索引和 `othername/pets.yaml` 别名表到 AstrBot 插件数据目录。
+- 新增 `/精灵图鉴 <精灵名>`，使用本地 Rocom-Atlas 图片查询精灵图鉴，支持 `火花 -> 火神`、`喵喵 -> 魔力猫` 等别名映射。
+
+#### 优化
+- 重建精灵 Wiki 和技能 Wiki 渲染模板，适配新版 Wiki 的精灵概览、资料、技能、家族、图鉴课题和技能可用精灵数据。
+- 新增统一 Wiki 渲染模板，用于列表、详情、联想和后端目录菜单等通用 Wiki 数据。
+- `/图鉴下载` 增加 20% 粒度进度提醒，并校验 Atlas 包内必须包含 `othername/pets.yaml`。
+- 蛋尺寸反查改用 `/api/v1/games/rocom/wiki/pet-size/query`，兼容新版 `items[].pet / egg_size / match` 响应结构。
+- 最新后端 API 文档迁移到插件目录外的 `参考文件/洛克王国文档/DOCS-API`，避免参考文件进入插件包。
+
+### v3.5.0 (2026-07-02)
+
+#### 优化
+- 字体资源改为启动时按需下载到 AstrBot 插件数据目录，优先使用 GitCode 字体源，GitHub 固定提交源作为备用
+- 插件包不再内置大体积字体文件，降低安装包体积并规避 AstrBot 插件大小限制
+- 字体下载失败时自动回退系统字体栈，避免因网络问题影响插件启动
+
+### v3.4.1 (2026-06-15)
+
+**优化**
+- 家园精灵变体标识扩展为异色、异色炫彩、炫彩三类，并使用 `img/异色.png`、`img/异色炫彩.png`、`img/炫彩.png` 新图标
+- 修复家园变体图标动态路径无法被渲染器内联导致的裂图问题
+- 家园长图改用 JPEG 输出压缩最终结果图体积，页面布局与渲染尺寸保持不变
+
+### v3.4.0 (2026-06-14)
+
+**新增**
+- 新增 `/订阅家园生蛋`，在家园轮询中支持首个生蛋可领取和全部生蛋可领取提醒
+- 家园精灵识别 `real_speciality_ids=103` 的异色标记，并在室内/守卫精灵展示异色图标
+
+**优化**
+- 家园查询适配后端新增的 `predicted_egg_time` 字段，室内精灵卡片会展示预计生蛋倒计时或可能已生蛋状态
+- 后台轮询任务接入实例注册与旧任务清理，避免插件重载后远行商人、家园、公告订阅重复轮询
+
+### v3.3.0 (2026-05-31)
+
+**新增**
+- 新增 `/洛克活动日历`，接入 `GET /api/v1/games/rocom/activities/info` 的活动日历数据
+- 活动日历新增独立时间轴渲染模板，展示活动状态、时间范围、封面与奖励摘要
+
+**优化**
+- 适配最新后端 ingame 队列协议，`/洛克玩家` 与 `/洛克家园` 支持绑定 token 省略 UID 的查询规则
+- 公告列表和公告详情按 Endfield 插件公告页面结构重构，保留洛克王国背景、字体与视觉资源
+
+### v3.2.0 (2026-05-24)
+
+**新增**
+- 接入洛克公告列表、公告详情、最新公告查询与新公告订阅推送
+- 查蛋名称查询改为后端图鉴优先，本地离线数据作为兜底
+
+**优化**
+- 家园 `home/info` 查询按新版队列协议处理：`wait_ms=5000`，收到 `202 task_id` 后轮询任务结果
+- 帮助菜单和配置项同步补充公告订阅说明
 
 ### v3.1.1 (2026-05-10)
 
@@ -388,7 +525,7 @@ astrbot_plugin_rocom/
 **新增**
 - 新增 `/远行商人` 指令，展示当前轮次商品
 - 新增 `/订阅远行商人 1|0` 与 `/取消订阅远行商人`，支持群管理员按群配置推送方式
-- 新增 `/洛克wiki <精灵名>` 与 `/洛克技能 <技能名>` 指令
+- 新增 Wiki 精灵与技能查询指令
 - 查蛋双参数尺寸反查正式接入后端 `pet/size-query`
 
 **优化**
@@ -510,7 +647,7 @@ astrbot_plugin_rocom/
 
 ## 🙏 鸣谢
 
-- **Astrbot**：[Soulter/AstrBot](https://github.com/Soulter/AstrBot) 提供强大的机器人开发与部署平台支撑
+- **Astrbot**：[AstrBotDevs/AstrBot](https://github.com/AstrBotDevs/AstrBot) 提供强大的机器人开发与部署平台支撑
 
 特别感谢：
 
@@ -527,7 +664,7 @@ astrbot_plugin_rocom/
 | 群聊                 | 群号                                           |
 | :----------------- | :------------------------------------------- |
 | astrbot洛克王国插件BUG反馈 | [870543663](https://qm.qq.com/q/kPxQZy5gg8)  |
-| 熵增项目组洛克王国插件交流      | [1097809141](https://qm.qq.com/q/8SuHC3siIM) |
+| 熵增项目组洛克王国交流      | [1097809141](https://qm.qq.com/q/8SuHC3siIM) |
 
 </div>
 

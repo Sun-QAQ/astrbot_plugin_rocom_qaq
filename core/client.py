@@ -163,14 +163,19 @@ class RocomClient:
         params: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
         accepted_statuses: tuple[int, ...] = (200,),
+        request_timeout: float | None = None,
     ) -> tuple[Optional[int], Optional[Dict]]:
         try:
             self._clear_last_error()
             client = await self._get_client()
+            timeout = request_timeout if request_timeout is not None else self.timeout
 
             if method == "GET":
                 resp = await client.get(
-                    f"{self.base_url}{path}", headers=headers, params=params
+                    f"{self.base_url}{path}",
+                    headers=headers,
+                    params=params,
+                    timeout=timeout,
                 )
             elif method == "POST":
                 resp = await client.post(
@@ -178,9 +183,14 @@ class RocomClient:
                     headers=headers,
                     json=json_data,
                     params=params,
+                    timeout=timeout,
                 )
             elif method == "DELETE":
-                resp = await client.delete(f"{self.base_url}{path}", headers=headers)
+                resp = await client.delete(
+                    f"{self.base_url}{path}",
+                    headers=headers,
+                    timeout=timeout,
+                )
             else:
                 logger.error(f"[Rocom API] 不支持的 HTTP 方法: {method}")
                 self._set_last_error(f"不支持的 HTTP 方法: {method}")
@@ -595,135 +605,523 @@ class RocomClient:
         )
 
     async def query_pet_size(
-        self, diameter: float, weight: float
+        self,
+        diameter: float,
+        weight: float,
+        pool: str = "magic",
+        page_no: int = 1,
+        page_size: int = 30,
     ) -> Optional[Dict]:
         """Query pet candidates by size."""
-        params = {"diameter": diameter, "weight": weight}
+        params = {
+            "diameter": diameter,
+            "weight": weight,
+            "pool": pool or "magic",
+            "include_display_only": "false",
+            "page_no": max(int(page_no or 1), 1),
+            "page_size": min(max(int(page_size or 30), 1), 100),
+        }
         return await self._get(
-            "/api/v1/games/rocom/pet/size-query",
+            "/api/v1/games/rocom/wiki/pet-size/query",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def search_egg_by_size(
+        self,
+        height: float,
+        weight: float,
+        page_no: int = 1,
+        page_size: int = 30,
+    ) -> Optional[Dict]:
+        """Query egg candidates by displayed height and weight."""
+        params = {
+            "height": height,
+            "weight": weight,
+            "page_no": max(int(page_no or 1), 1),
+            "page_size": min(max(int(page_size or 30), 1), 100),
+        }
+        return await self._get(
+            "/api/v1/games/rocom/egg/search",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def get_egg_groups(self) -> Optional[Dict]:
+        """Query egg group dictionary."""
+        return await self._get(
+            "/api/v1/games/rocom/egg/groups",
+            self._wegame_headers(),
+        )
+
+    async def get_egg_group_pets(
+        self,
+        group_ids: list[int] | tuple[int, ...] | str,
+        match_mode: str = "all",
+        page_no: int = 1,
+        page_size: int = 60,
+    ) -> Optional[Dict]:
+        """Query pets by egg group ids."""
+        if isinstance(group_ids, str):
+            group_id_text = group_ids
+        else:
+            group_id_text = ",".join(str(item) for item in group_ids if item not in (None, ""))
+        if not group_id_text:
+            self._set_last_error("蛋组 ID 不能为空")
+            return None
+        params = {
+            "group_ids": group_id_text,
+            "match_mode": match_mode or "all",
+            "page_no": max(int(page_no or 1), 1),
+            "page_size": min(max(int(page_size or 60), 1), 100),
+        }
+        return await self._get(
+            "/api/v1/games/rocom/egg/group-pets",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def get_egg_pet_groups(
+        self,
+        q: str,
+        limit: int = 20,
+    ) -> Optional[Dict]:
+        """Query egg groups by pet name or form keyword."""
+        keyword = str(q or "").strip()
+        if not keyword:
+            self._set_last_error("精灵名称不能为空")
+            return None
+        params = {
+            "q": keyword,
+            "limit": min(max(int(limit or 20), 1), 50),
+        }
+        return await self._get(
+            "/api/v1/games/rocom/egg/pet-groups",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def list_wiki_pets(
+        self,
+        q: str = "",
+        page_no: int = 1,
+        page_size: int = 10,
+        **filters: Any,
+    ) -> Optional[Dict]:
+        params: Dict[str, Any] = {
+            "page_no": max(int(page_no or 1), 1),
+            "page_size": min(max(int(page_size or 10), 1), 100),
+        }
+        if q:
+            params["q"] = q
+        for key, value in filters.items():
+            if value not in (None, ""):
+                params[key] = value
+        return await self._get(
+            "/api/v1/games/rocom/wiki/pets",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def get_wiki_pet(self, pet_id: int | str) -> Optional[Dict]:
+        return await self._get(
+            f"/api/v1/games/rocom/wiki/pets/{pet_id}",
+            self._wegame_headers(),
+        )
+
+    async def get_wiki_pet_profile(self, pet_id: int | str) -> Optional[Dict]:
+        return await self._get(
+            f"/api/v1/games/rocom/wiki/pets/{pet_id}/profile",
+            self._wegame_headers(),
+        )
+
+    async def get_wiki_pet_skills(self, pet_id: int | str) -> Optional[Dict]:
+        return await self._get(
+            f"/api/v1/games/rocom/wiki/pets/{pet_id}/skills",
+            self._wegame_headers(),
+        )
+
+    async def get_wiki_pet_family(self, pet_id: int | str) -> Optional[Dict]:
+        return await self._get(
+            f"/api/v1/games/rocom/wiki/pets/{pet_id}/family",
+            self._wegame_headers(),
+        )
+
+    async def get_wiki_pet_handbook(self, pet_id: int | str) -> Optional[Dict]:
+        return await self._get(
+            f"/api/v1/games/rocom/wiki/pets/{pet_id}/handbook",
+            self._wegame_headers(),
+        )
+
+    async def list_wiki_skills(
+        self,
+        q: str = "",
+        page_no: int = 1,
+        page_size: int = 10,
+        **filters: Any,
+    ) -> Optional[Dict]:
+        params: Dict[str, Any] = {
+            "page_no": max(int(page_no or 1), 1),
+            "page_size": min(max(int(page_size or 10), 1), 100),
+        }
+        if q:
+            params["q"] = q
+        for key, value in filters.items():
+            if value not in (None, ""):
+                params[key] = value
+        return await self._get(
+            "/api/v1/games/rocom/wiki/skills",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def get_wiki_skill(self, skill_id: int | str) -> Optional[Dict]:
+        return await self._get(
+            f"/api/v1/games/rocom/wiki/skills/{skill_id}",
+            self._wegame_headers(),
+        )
+
+    async def get_wiki_skill_pets(self, skill_id: int | str) -> Optional[Dict]:
+        return await self._get(
+            f"/api/v1/games/rocom/wiki/skills/{skill_id}/pets",
+            self._wegame_headers(),
+        )
+
+    async def get_wiki_catalogs(self) -> Optional[Dict]:
+        return await self._get(
+            "/api/v1/games/rocom/wiki/catalogs",
+            self._wegame_headers(),
+        )
+
+    async def get_wiki_options(self) -> Optional[Dict]:
+        return await self._get(
+            "/api/v1/games/rocom/wiki/options",
+            self._wegame_headers(),
+        )
+
+    async def get_wiki_path(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict]:
+        path = str(path or "").strip()
+        if not path.startswith("/api/v1/games/rocom/wiki/"):
+            self._set_last_error("非法 Wiki 路径")
+            return None
+        return await self._get(path, self._wegame_headers(), params=params or {})
+
+    async def list_wiki_catalog_items(
+        self,
+        path: str,
+        q: str = "",
+        page_no: int = 1,
+        page_size: int = 10,
+        search: bool = True,
+    ) -> Optional[Dict]:
+        params: Dict[str, Any] = {
+            "page_no": max(int(page_no or 1), 1),
+            "page_size": min(max(int(page_size or 10), 1), 100),
+        }
+        if q and search:
+            params["q"] = q
+        return await self.get_wiki_path(path, params=params)
+
+    async def get_pet_list(
+        self,
+        q: str = "",
+        egg_group: str = "",
+        page_no: int = 1,
+        page_size: int = 20,
+    ) -> Optional[Dict]:
+        params: Dict[str, Any] = {
+            "page_no": max(int(page_no or 1), 1),
+            "page_size": min(max(int(page_size or 20), 1), 100),
+        }
+        if q:
+            params["q"] = q
+        if egg_group:
+            params["egg_group"] = egg_group
+        return await self._get(
+            "/api/v1/games/rocom/pet/list",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def get_pet_detail(
+        self, pet_id: int | str | None = None, name: str = ""
+    ) -> Optional[Dict]:
+        params: Dict[str, Any] = {}
+        if pet_id not in (None, ""):
+            params["id"] = pet_id
+        elif name:
+            params["name"] = name
+        else:
+            self._set_last_error("宠物 ID 或名称不能为空")
+            return None
+        return await self._get(
+            "/api/v1/games/rocom/pet/detail",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def get_announcement_list(
+        self,
+        category_id: int = 99,
+        page: int = 1,
+        limit: int = 10,
+        order: str = "ttDesc",
+    ) -> Optional[Dict]:
+        params = {
+            "category_id": category_id,
+            "page": max(int(page or 1), 1),
+            "limit": min(max(int(limit or 10), 1), 50),
+            "order": order or "ttDesc",
+        }
+        return await self._get(
+            "/api/v1/games/rocom/announcement/list",
+            self._wegame_headers(),
+            params=params,
+        )
+
+    async def get_announcement_latest(
+        self, category_id: int = 99, order: str = "ttDesc"
+    ) -> Optional[Dict]:
+        return await self._get(
+            "/api/v1/games/rocom/announcement/latest",
+            self._wegame_headers(),
+            params={"category_id": category_id, "order": order or "ttDesc"},
+        )
+
+    async def get_announcement_detail(self, thread_id: int | str) -> Optional[Dict]:
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            self._set_last_error("公告 ID 不能为空")
+            return None
+        return await self._get(
+            "/api/v1/games/rocom/announcement/detail",
+            self._wegame_headers(),
+            params={"thread_id": thread_id},
+        )
+
+    async def get_activities_info(self, refresh: bool = False) -> Optional[Dict]:
+        """Query RoCom activities and calendar data."""
+        params = {"refresh": "true" if refresh else "false"}
+        return await self._get(
+            "/api/v1/games/rocom/activities/info",
             self._wegame_headers(),
             params=params,
         )
 
     async def search_wiki_pet(self, query: str, limit: int = 10) -> Optional[Dict]:
         """Search pet wiki entries."""
-        params = {"q": query, "limit": limit}
-        return await self._get(
-            "/api/v1/games/rocom/wiki/pet",
-            self._wegame_headers(),
-            params=params,
-        )
+        return await self.list_wiki_pets(q=query, page_no=1, page_size=limit)
 
     async def search_wiki_skill(self, query: str, limit: int = 10) -> Optional[Dict]:
         """Search skill wiki entries."""
-        params = {"q": query, "limit": limit}
-        return await self._get(
-            "/api/v1/games/rocom/wiki/skill",
-            self._wegame_headers(),
-            params=params,
-        )
+        return await self.list_wiki_skills(q=query, page_no=1, page_size=limit)
 
-    async def get_ingame_task(self, task_id: str) -> tuple[Optional[int], Optional[Dict]]:
+    async def get_ingame_task(
+        self,
+        task_id: str,
+        fw_token: str = "",
+        user_identifier: str = "",
+    ) -> tuple[Optional[int], Optional[Dict]]:
         return await self._request_with_status(
             "GET",
             f"/api/v1/games/rocom/ingame/tasks/{task_id}",
-            self._wegame_headers(),
+            self._wegame_headers(fw_token, user_identifier=user_identifier),
             accepted_statuses=(200, 202),
+            request_timeout=10.0,
         )
 
-    async def ingame_player_search(self, uid: str) -> Optional[Dict]:
+    def _task_result_payload(self, task_data: Optional[Dict]) -> Optional[Dict]:
+        if not isinstance(task_data, dict):
+            return task_data
+        status = str(task_data.get("status") or "").lower()
+        if status in {"queued", "pending", "running", "processing"}:
+            return None
+        for key in ("result", "data"):
+            value = task_data.get(key)
+            if isinstance(value, dict):
+                return value
+        if any(key in task_data for key in ("rows", "home_info", "source", "title", "npc_pet", "npc_pets", "query_status")):
+            return task_data
+        return task_data
+
+    async def _poll_ingame_task(
+        self,
+        task_id: str,
+        label: str,
+        fw_token: str = "",
+        user_identifier: str = "",
+        max_wait_seconds: int = 180,
+        poll_interval: int = 5,
+    ) -> Optional[Dict]:
+        for _ in range(max(1, max_wait_seconds // poll_interval)):
+            await asyncio.sleep(poll_interval)
+            task_status, task_data = await self.get_ingame_task(
+                task_id,
+                fw_token=fw_token,
+                user_identifier=user_identifier,
+            )
+            if task_status is None:
+                return None
+            result = self._task_result_payload(task_data)
+            if result:
+                return result
+            status = str((task_data or {}).get("status") or "").lower()
+            if status in {"failed", "error", "cancelled", "canceled"}:
+                self._set_last_error(
+                    str((task_data or {}).get("message") or f"{label}任务执行失败")
+                )
+                return None
+
+        self._set_last_error(f"{label}任务仍在队列中，请稍后重试（task_id: {task_id}）")
+        return None
+
+    async def _ingame_queued_query(
+        self,
+        path: str,
+        label: str,
+        uid: str = "",
+        fw_token: str = "",
+        user_identifier: str = "",
+        wait_ms: int = 5000,
+        max_wait_seconds: int = 180,
+        uid_param: str = "uid",
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict]:
         uid = self._sanitize_uid(uid)
-        if not uid:
+        user_identifier = self._sanitize_uid(user_identifier)
+        if not uid and not fw_token:
             self._set_last_error("UID 不能为空")
             return None
 
-        path = "/api/v1/games/rocom/ingame/player/search"
-        headers = self._wegame_headers()
-        wait_ms = 5000
+        headers = self._wegame_headers(fw_token, user_identifier=user_identifier)
+        body: Dict[str, Any] = {"wait_ms": wait_ms}
+        params: Dict[str, Any] = {"wait_ms": wait_ms}
+        if uid:
+            body[uid_param or "uid"] = uid
+            params[uid_param or "uid"] = uid
+        for key, value in (extra_payload or {}).items():
+            if value not in (None, ""):
+                body[key] = value
+                params[key] = value
 
         status_code, data = await self._request_with_status(
             "POST",
             path,
             headers,
-            json_data={"uid": uid, "wait_ms": wait_ms},
+            json_data=body,
             accepted_statuses=(200, 202),
+            request_timeout=10.0,
         )
         if status_code == 200:
-            return data
+            task_id = (data or {}).get("task_id")
+            if task_id:
+                return await self._poll_ingame_task(
+                    task_id,
+                    label,
+                    fw_token=fw_token,
+                    user_identifier=user_identifier,
+                    max_wait_seconds=max_wait_seconds,
+                )
+            return self._task_result_payload(data) or data
 
         if status_code is None:
             status_code, data = await self._request_with_status(
                 "GET",
                 path,
                 headers,
-                params={"uid": uid, "wait_ms": wait_ms},
+                params=params,
                 accepted_statuses=(200, 202),
+                request_timeout=10.0,
             )
             if status_code == 200:
-                return data
+                task_id = (data or {}).get("task_id")
+                if task_id:
+                    return await self._poll_ingame_task(
+                        task_id,
+                        label,
+                        fw_token=fw_token,
+                        user_identifier=user_identifier,
+                        max_wait_seconds=max_wait_seconds,
+                    )
+                return self._task_result_payload(data) or data
 
         task_id = (data or {}).get("task_id")
         if not task_id:
             if status_code == 202:
-                self._set_last_error("玩家搜索任务已入队，但未返回 task_id")
+                self._set_last_error(f"{label}任务已入队，但未返回 task_id")
             return None
 
-        for _ in range(8):
-            await asyncio.sleep(1)
-            task_status, task_data = await self.get_ingame_task(task_id)
-            if task_status == 200:
-                return task_data
-            if task_status is None:
-                return None
-
-        self._set_last_error(f"玩家搜索任务仍在队列中，请稍后重试（task_id: {task_id}）")
-        return None
-
-    async def ingame_home_info(self, uid: str, wait_ms: int = 5000) -> Optional[Dict]:
-        uid = self._sanitize_uid(uid)
-        if not uid:
-            self._set_last_error("UID 不能为空")
-            return None
-
-        path = "/api/v1/games/rocom/ingame/home/info"
-        headers = self._wegame_headers()
-        status_code, data = await self._request_with_status(
-            "POST",
-            path,
-            headers,
-            json_data={"uid": uid, "wait_ms": wait_ms},
-            accepted_statuses=(200, 202),
+        return await self._poll_ingame_task(
+            task_id,
+            label,
+            fw_token=fw_token,
+            user_identifier=user_identifier,
+            max_wait_seconds=max_wait_seconds,
         )
-        if status_code == 200:
-            return data
 
-        if status_code is None:
-            status_code, data = await self._request_with_status(
-                "GET",
-                path,
-                headers,
-                params={"uid": uid, "wait_ms": wait_ms},
-                accepted_statuses=(200, 202),
-            )
-            if status_code == 200:
-                return data
+    async def ingame_pet_data(
+        self,
+        uid: str = "",
+        pet_gid: int | str | None = None,
+        npc_id: int | str | None = None,
+        wait_ms: int = 20000,
+        fw_token: str = "",
+        user_identifier: str = "",
+    ) -> Optional[Dict]:
+        payload: Dict[str, Any] = {}
+        if pet_gid not in (None, ""):
+            payload["pet_gid"] = pet_gid
+        if npc_id not in (None, ""):
+            payload["npc_id"] = npc_id
+        return await self._ingame_queued_query(
+            "/api/v1/games/rocom/ingame/pet/data",
+            "精灵数据查询",
+            uid=uid,
+            fw_token=fw_token,
+            user_identifier=user_identifier,
+            wait_ms=wait_ms,
+            max_wait_seconds=180,
+            uid_param="target_uin",
+            extra_payload=payload,
+        )
 
-        task_id = (data or {}).get("task_id")
-        if not task_id:
-            if status_code == 202:
-                self._set_last_error("家园查询任务已入队，但未返回 task_id")
-            return None
+    async def ingame_player_search(
+        self,
+        uid: str = "",
+        fw_token: str = "",
+        user_identifier: str = "",
+        wait_ms: int = 5000,
+    ) -> Optional[Dict]:
+        return await self._ingame_queued_query(
+            "/api/v1/games/rocom/ingame/player/search",
+            "玩家搜索",
+            uid=uid,
+            fw_token=fw_token,
+            user_identifier=user_identifier,
+            wait_ms=wait_ms,
+            max_wait_seconds=180,
+        )
 
-        for _ in range(10):
-            await asyncio.sleep(1)
-            task_status, task_data = await self.get_ingame_task(task_id)
-            if task_status == 200:
-                return task_data
-            if task_status is None:
-                return None
-
-        self._set_last_error(f"家园查询任务仍在队列中，请稍后重试（task_id: {task_id}）")
-        return None
+    async def ingame_home_info(
+        self,
+        uid: str = "",
+        wait_ms: int = 5000,
+        fw_token: str = "",
+        user_identifier: str = "",
+    ) -> Optional[Dict]:
+        return await self._ingame_queued_query(
+            "/api/v1/games/rocom/ingame/home/info",
+            "家园查询",
+            uid=uid,
+            fw_token=fw_token,
+            user_identifier=user_identifier,
+            wait_ms=wait_ms,
+            max_wait_seconds=180,
+        )
 
     async def ingame_merchant_info(self, shop_id: int | str) -> Optional[Dict]:
         params = {"shop_id": shop_id}

@@ -13,6 +13,7 @@ import mimetypes
 import uuid
 import tempfile
 import jinja2
+from pathlib import Path
 from typing import Dict, Any, Optional
 from astrbot.api import logger
 
@@ -31,9 +32,10 @@ class Renderer:
             )
         return cls._jinja_env
 
-    def __init__(self, res_path: str, render_timeout: int = 30000):
+    def __init__(self, res_path: str, render_timeout: int = 30000, font_paths: Optional[Dict[str, str]] = None):
         self.res_path = res_path
         self.render_timeout = render_timeout
+        self.font_paths = font_paths or {}
         self._browser = None
         self._playwright = None
         self._lock = asyncio.Lock()
@@ -189,6 +191,7 @@ class Renderer:
                         return ""
                 
                 css_content = self._adapt_template(css_content)
+                css_content = self._rewrite_font_urls(css_content)
                 return f"<style>\n{css_content}\n</style>"
             return ""
 
@@ -236,7 +239,26 @@ class Renderer:
             inline_style_bg,
             html,
         )
+        html = self._rewrite_font_urls(html)
         return html
+
+    def _rewrite_font_urls(self, content: str) -> str:
+        if not self.font_paths:
+            return content
+
+        def replace_font_url(match):
+            raw_path = match.group(1)
+            filename = os.path.basename(raw_path.replace("\\", "/"))
+            font_path = self.font_paths.get(filename)
+            if not font_path or not os.path.exists(font_path):
+                return match.group(0)
+            return f"url('{Path(font_path).resolve().as_uri()}')"
+
+        return re.sub(
+            r"url\(\s*['\"]?(?:\{\{(?:_res_path|pluResPath)\}\})?(?:\.\./\.\./)?ttf/([^)'\"]+\.(?:ttf|woff2))['\"]?\s*\)",
+            replace_font_url,
+            content,
+        )
 
     def _render_jinja(
         self, template_str: str, data: Dict[str, Any]
@@ -251,17 +273,56 @@ class Renderer:
             logger.error(f"[Rocom Render] Jinja2 渲染错误: {e}")
             return None
 
+    async def _close_browser_instance(self) -> None:
+        async with self._lock:
+            browser = self._browser
+            self._browser = None
+            if not browser:
+                return
+            try:
+                await asyncio.wait_for(browser.close(), timeout=5)
+            except Exception:
+                try:
+                    if self._playwright:
+                        await asyncio.wait_for(self._playwright.stop(), timeout=5)
+                except Exception:
+                    pass
+                self._playwright = None
+
     async def _screenshot(
         self, html: str, name: str, options: Optional[Dict]
     ) -> Optional[str]:
         """Playwright 截图"""
-        from playwright.async_api import async_playwright
-
-        output_path = os.path.join(
-            self._output_dir, f"render_{uuid.uuid4().hex[:8]}.png"
+        from playwright.async_api import (
+            async_playwright,
+            TimeoutError as PlaywrightTimeoutError,
         )
 
+        context = None
+        page = None
+        el = None
+        temp_html = ""
+        reset_browser = False
+        render_meta: Dict[str, Any] = {}
+
         try:
+            options = options or {}
+            image_format = str(options.get("image_format", "png") or "png").lower()
+            if image_format in {"jpg", "jpeg"}:
+                image_format = "jpeg"
+                output_ext = "jpg"
+            else:
+                image_format = "png"
+                output_ext = "png"
+            try:
+                image_quality = int(options.get("image_quality", 85))
+            except (TypeError, ValueError):
+                image_quality = 85
+            image_quality = min(max(image_quality, 1), 100)
+            output_path = os.path.join(
+                self._output_dir, f"render_{uuid.uuid4().hex[:8]}.{output_ext}"
+            )
+
             async with self._lock:
                 # 确保 playwright 和 browser 可用，处理 stale 实例
                 try:
@@ -284,10 +345,15 @@ class Renderer:
                     self._playwright = await async_playwright().start()
                     self._browser = await self._playwright.chromium.launch()
 
-            options = options or {}
             device_scale_factor = float(options.get("device_scale_factor", 2.0))
             viewport_width = int(options.get("viewport_width", 1400))
             viewport_height = int(options.get("viewport_height", 900))
+            try:
+                screenshot_timeout = int(options.get("screenshot_timeout", self.render_timeout))
+            except (TypeError, ValueError):
+                screenshot_timeout = int(self.render_timeout)
+            screenshot_timeout = max(screenshot_timeout, 1000)
+            screenshot_scale = str(options.get("screenshot_scale", "") or "").strip().lower()
 
             context = await self._browser.new_context(
                 device_scale_factor=device_scale_factor,
@@ -313,19 +379,38 @@ class Renderer:
             except Exception:
                 pass  # 部分外部资源超时无妨
 
-            # 等待图片加载
+            # 等待图片加载，但不要让慢速远程资源拖垮整次渲染。
+            try:
+                image_wait_timeout = int(options.get("image_wait_timeout", 10000))
+            except (TypeError, ValueError):
+                image_wait_timeout = 10000
+            image_wait_timeout = min(max(image_wait_timeout, 1000), max(int(self.render_timeout) - 1000, 1000))
             await page.evaluate(
                 """
-                Promise.all(Array.from(document.images).map(img => {
-                    if (img.complete) return Promise.resolve();
-                    return new Promise(resolve => {
-                        img.onload = resolve;
-                        img.onerror = resolve;
-                    });
-                }))
-            """
+                timeout => Promise.race([
+                    Promise.all(Array.from(document.images).map(img => {
+                        if (img.complete) return Promise.resolve();
+                        return new Promise(resolve => {
+                            img.onload = resolve;
+                            img.onerror = resolve;
+                        });
+                    })),
+                    new Promise(resolve => setTimeout(resolve, timeout))
+                ])
+                """,
+                image_wait_timeout,
             )
             await page.wait_for_timeout(500)
+            await page.add_style_tag(
+                content="""
+                *, *::before, *::after {
+                    animation-duration: 0s !important;
+                    animation-delay: 0s !important;
+                    transition-duration: 0s !important;
+                    transition-delay: 0s !important;
+                }
+                """
+            )
 
             # 优先查找第一个非 body 的块级元素，避免截取到多余的空白
             el = await page.evaluate_handle("""
@@ -333,6 +418,7 @@ class Renderer:
                     // 尝试查找常见的内容容器
                     const selectors = [
                         '.exchange-page',
+                        '.wiki-page',
                         '.record-page', 
                         '.package-cont',
                         '.searcheggs-cont',
@@ -342,11 +428,15 @@ class Renderer:
                         '.lineup-page',
                         '.inspect-page',
                         '.player-search-page',
+                        '.pet-data-page',
                         '.ingame-shop-page',
                         '.friendship-page',
                         '.student-state-page',
                         '.student-perks-page',
-                        '.student-page'
+                        '.student-page',
+                        '.announcement-list-page',
+                        '.announcement-detail-page',
+                        '.activity-calendar-page'
                     ];
                     for (const selector of selectors) {
                         const element = document.querySelector(selector);
@@ -358,29 +448,95 @@ class Renderer:
             """)
             box = await el.bounding_box() if el else None
             if box and el:
+                render_meta = {
+                    "width": round(float(box["width"]), 2),
+                    "height": round(float(box["height"]), 2),
+                    "device_scale_factor": device_scale_factor,
+                    "image_format": image_format,
+                }
+                logger.debug(f"[Rocom Render] 截图区域: {render_meta}")
                 await page.set_viewport_size(
                     {
-                        "width": max(int(box["width"]) + 8, 200),
-                        "height": max(int(box["height"]) + 8, 200),
+                        "width": max(int(box["x"] + box["width"]) + 8, 200),
+                        "height": max(int(box["y"] + box["height"]) + 8, 200),
                     }
                 )
                 await page.wait_for_timeout(100)
-                await el.screenshot(path=output_path, type="png")
+                # Some templates are centered with auto margins. Resizing the viewport
+                # after the first measurement can change x/y, so measure again.
+                new_box = await el.bounding_box()
+                if new_box:
+                    box = new_box
+                    render_meta.update(
+                        {
+                            "width": round(float(box["width"]), 2),
+                            "height": round(float(box["height"]), 2),
+                            "x": round(float(box["x"]), 2),
+                            "y": round(float(box["y"]), 2),
+                        }
+                    )
+                screenshot_options = {
+                    "path": output_path,
+                    "type": image_format,
+                    "clip": {
+                        "x": max(float(box["x"]), 0),
+                        "y": max(float(box["y"]), 0),
+                        "width": max(float(box["width"]), 1),
+                        "height": max(float(box["height"]), 1),
+                    },
+                    "animations": "disabled",
+                    "timeout": screenshot_timeout,
+                }
+                if screenshot_scale in {"css", "device"}:
+                    screenshot_options["scale"] = screenshot_scale
+                if image_format == "jpeg":
+                    screenshot_options["quality"] = image_quality
+                await page.screenshot(**screenshot_options)
             else:
-                await page.screenshot(path=output_path, full_page=True)
-
-            if el:
-                await el.dispose()
-
-            if os.path.exists(temp_html):
-                os.remove(temp_html)
-            await page.close()
-            await context.close()
+                screenshot_options = {
+                    "path": output_path,
+                    "full_page": True,
+                    "type": image_format,
+                    "animations": "disabled",
+                    "timeout": screenshot_timeout,
+                }
+                if screenshot_scale in {"css", "device"}:
+                    screenshot_options["scale"] = screenshot_scale
+                if image_format == "jpeg":
+                    screenshot_options["quality"] = image_quality
+                await page.screenshot(**screenshot_options)
             return output_path
 
+        except (PlaywrightTimeoutError, asyncio.TimeoutError) as e:
+            reset_browser = True
+            logger.error(f"[Rocom Render] Playwright 渲染超时: {e}; meta={render_meta}")
+            return None
         except Exception as e:
             logger.error(f"[Rocom Render] Playwright 渲染错误: {e}")
             return None
+        finally:
+            if el:
+                try:
+                    await el.dispose()
+                except Exception:
+                    pass
+            if page:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=3)
+                except Exception:
+                    reset_browser = True
+            if context:
+                try:
+                    await asyncio.wait_for(context.close(), timeout=3)
+                except Exception:
+                    reset_browser = True
+            if temp_html and os.path.exists(temp_html):
+                try:
+                    os.remove(temp_html)
+                except Exception:
+                    pass
+            if reset_browser:
+                await self._close_browser_instance()
 
     async def close(self):
         if self._cache_cleanup_task and not self._cache_cleanup_task.done():
