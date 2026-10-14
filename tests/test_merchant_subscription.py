@@ -26,6 +26,13 @@ def _install_astrbot_stubs():
 
             return decorator
 
+        def command_group(self, *args, **kwargs):
+            def decorator(func):
+                func.command = self.command
+                return func
+
+            return decorator
+
     class _MessageChain:
         def at_all(self):
             return self

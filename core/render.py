@@ -32,10 +32,11 @@ class Renderer:
             )
         return cls._jinja_env
 
-    def __init__(self, res_path: str, render_timeout: int = 30000, font_paths: Optional[Dict[str, str]] = None):
+    def __init__(self, res_path: str, render_timeout: int = 30000, font_paths: Optional[Dict[str, str]] = None, prepare_fonts: Optional[Any] = None):
         self.res_path = res_path
         self.render_timeout = render_timeout
         self.font_paths = font_paths or {}
+        self.prepare_fonts = prepare_fonts
         self._browser = None
         self._playwright = None
         self._lock = asyncio.Lock()
@@ -88,8 +89,12 @@ class Renderer:
         template_name: str,
         data: Dict[str, Any],
         options: Optional[Dict] = None,
+        before_render: Optional[Any] = None,
     ) -> Optional[str]:
         """渲染 HTML 模板为图片，返回图片路径"""
+        prepare = before_render or self.prepare_fonts
+        if prepare is not None:
+            await prepare()
         tmpl_content = self.get_template(template_name)
         if not tmpl_content:
             logger.error(f"[Rocom Render] 模板不存在: {template_name}")
@@ -100,6 +105,9 @@ class Renderer:
         html_content = self._render_jinja(adapted, data)
         if not html_content:
             return None
+        # Runtime data can contain asset placeholders (for example fallback
+        # product images). Resolve those after Jinja has expanded the data.
+        html_content = self._inline_assets(html_content)
 
         return await self._screenshot(html_content, template_name, options)
 
@@ -267,7 +275,10 @@ class Renderer:
         try:
             env = self._get_jinja_env()
             data_copy = data.copy()
-            data_copy["_res_path"] = data_copy.get("pluResPath", "X")
+            resource_path = data_copy.get("pluResPath")
+            if not resource_path:
+                resource_path = Path(self.res_path).resolve().as_uri() + "/"
+            data_copy["_res_path"] = resource_path
             return env.from_string(template_str).render(**data_copy)
         except Exception as e:
             logger.error(f"[Rocom Render] Jinja2 渲染错误: {e}")
@@ -426,6 +437,8 @@ class Renderer:
                         '.skill-shell',
                         '.page-section-main',
                         '.lineup-page',
+                        '.pet-ranking-page',
+                        '.share-code-page',
                         '.inspect-page',
                         '.player-search-page',
                         '.pet-data-page',
